@@ -52,7 +52,55 @@ void PrepareWebView2UserData() {
     }
 }
 
-// Read file using wide character operations for proper Unicode support
+// Detect if data contains UTF-8 BOM or is valid UTF-8
+bool IsUtf8(const std::string& data) {
+    // Check for UTF-8 BOM
+    if (data.size() >= 3 && (unsigned char)data[0] == 0xEF && 
+        (unsigned char)data[1] == 0xBB && (unsigned char)data[2] == 0xBF) {
+        return true;
+    }
+    
+    // Simple UTF-8 validation heuristic
+    const unsigned char* bytes = (const unsigned char*)data.c_str();
+    size_t len = data.length();
+    
+    for (size_t i = 0; i < len; ) {
+        if (bytes[i] < 0x80) {
+            i++; // ASCII
+        } else if ((bytes[i] & 0xE0) == 0xC0) {
+            if (i + 1 >= len || (bytes[i + 1] & 0xC0) != 0x80) return false;
+            i += 2; // 2-byte UTF-8
+        } else if ((bytes[i] & 0xF0) == 0xE0) {
+            if (i + 2 >= len || (bytes[i + 1] & 0xC0) != 0x80 || (bytes[i + 2] & 0xC0) != 0x80) return false;
+            i += 3; // 3-byte UTF-8
+        } else if ((bytes[i] & 0xF8) == 0xF0) {
+            if (i + 3 >= len || (bytes[i + 1] & 0xC0) != 0x80 || (bytes[i + 2] & 0xC0) != 0x80 || (bytes[i + 3] & 0xC0) != 0x80) return false;
+            i += 4; // 4-byte UTF-8
+        } else {
+            return false; // Invalid UTF-8
+        }
+    }
+    return true;
+}
+
+// Convert ANSI (system codepage) to UTF-8
+std::string AnsiToUtf8(const std::string& ansi) {
+    if (ansi.empty()) return std::string();
+    
+    // Convert ANSI to wide string using system codepage
+    int size_needed = MultiByteToWideChar(CP_ACP, 0, &ansi[0], (int)ansi.size(), NULL, 0);
+    std::wstring wstr(size_needed, 0);
+    MultiByteToWideChar(CP_ACP, 0, &ansi[0], (int)ansi.size(), &wstr[0], size_needed);
+    
+    // Convert wide string to UTF-8
+    size_needed = WideCharToMultiByte(CP_UTF8, 0, &wstr[0], (int)wstr.size(), NULL, 0, NULL, NULL);
+    std::string utf8(size_needed, 0);
+    WideCharToMultiByte(CP_UTF8, 0, &wstr[0], (int)wstr.size(), &utf8[0], size_needed, NULL, NULL);
+    
+    return utf8;
+}
+
+// Read file and convert to UTF-8, supporting both UTF-8 and ANSI encodings
 std::string ReadAllUtf8(const std::wstring& wpath) {
     FILE* f = _wfopen(wpath.c_str(), L"rb");
     if (!f) {
@@ -69,7 +117,32 @@ std::string ReadAllUtf8(const std::wstring& wpath) {
     fclose(f);
     
     DebugLog("ReadAllUtf8: Read " + std::to_string(data.length()) + " bytes");
-    return data;
+    
+    // Check if the data is already UTF-8
+    if (IsUtf8(data)) {
+        // Remove UTF-8 BOM if present
+        if (data.size() >= 3 && (unsigned char)data[0] == 0xEF && 
+            (unsigned char)data[1] == 0xBB && (unsigned char)data[2] == 0xBF) {
+            data = data.substr(3);
+            DebugLog("ReadAllUtf8: Removed UTF-8 BOM");
+        }
+        DebugLog("ReadAllUtf8: File detected as UTF-8");
+        return data;
+    } else {
+        // Assume ANSI and convert to UTF-8
+        DebugLog("ReadAllUtf8: File detected as ANSI, converting to UTF-8");
+        return AnsiToUtf8(data);
+    }
+}
+
+// Convert UTF-8 string to UTF-16 wide string
+std::wstring Utf8ToWide(const std::string& utf8) {
+    if (utf8.empty()) return std::wstring();
+    
+    int size_needed = MultiByteToWideChar(CP_UTF8, 0, &utf8[0], (int)utf8.size(), NULL, 0);
+    std::wstring wstrTo(size_needed, 0);
+    MultiByteToWideChar(CP_UTF8, 0, &utf8[0], (int)utf8.size(), &wstrTo[0], size_needed);
+    return wstrTo;
 }
 
 // WLX Plugin constants (from listplug.h)
@@ -460,7 +533,7 @@ __declspec(dllexport) HWND __stdcall ListLoad(HWND ParentWin, char* FileToLoad, 
                                 
                                 // Feed HTML directly
                                 if (g_views[hwnd].webview) {
-                                    std::wstring whtml(htmlCopy.begin(), htmlCopy.end());
+                                    std::wstring whtml = Utf8ToWide(htmlCopy);
                                     g_views[hwnd].webview->NavigateToString(whtml.c_str());
                                     DebugLog("WebView2 HTML content set, length: " + std::to_string(htmlCopy.length()));
                                     
@@ -688,7 +761,7 @@ __declspec(dllexport) HWND __stdcall ListLoadW(HWND ParentWin, WCHAR* FileToLoad
                                 
                                 // Feed HTML directly
                                 if (g_views[hwnd].webview) {
-                                    std::wstring whtml(htmlCopy.begin(), htmlCopy.end());
+                                    std::wstring whtml = Utf8ToWide(htmlCopy);
                                     g_views[hwnd].webview->NavigateToString(whtml.c_str());
                                     DebugLog("WebView2 HTML content set, length: " + std::to_string(htmlCopy.length()));
                                     
