@@ -16,10 +16,13 @@
 using Microsoft::WRL::Callback;
 using Microsoft::WRL::ComPtr;
 
-// Debug logging function
+// Debug logging function (only active when DEBUG_LOG is defined)
 void DebugLog(const std::string& message) {
+#ifdef DEBUG_LOG
     try {
-        std::string logPath = "F:\\devel\\mdviewer\\debug\\debug.log";
+        char tempPath[MAX_PATH];
+        GetTempPathA(MAX_PATH, tempPath);
+        std::string logPath = std::string(tempPath) + "tc_markdown_lister.log";
         
         std::ofstream logFile(logPath, std::ios::app);
         if (logFile.is_open()) {
@@ -33,6 +36,7 @@ void DebugLog(const std::string& message) {
     } catch (...) {
         // Ignore logging errors
     }
+#endif
 }
 
 // Prepare WebView2 user data folder
