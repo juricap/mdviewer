@@ -1,0 +1,41 @@
+# Build artifacts
+*.exe
+*.obj
+*.pdb
+*.ilk
+*.exp
+*.lib
+
+# Visual Studio files
+*.vcxproj
+*.vcxproj.filters
+*.vcxproj.user
+*.sln
+.vs/
+
+# Build directories
+build/
+Debug/
+Release/
+x64/
+x86/
+
+# Downloaded dependencies
+packages/
+webview-master/
+webview.zip
+maddy.zip
+
+# CMake
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+
+# IDE
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
