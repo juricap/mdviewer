@@ -1,5 +1,5 @@
 [plugininstall]
 description=Markdown viewer with WebView2 rendering and GitHub-style formatting.
 type=wlx
-file=tc_markdown_lister.wlx
+file=tc_markdown_lister.wlx64
 defaultdir=plugins\wlx\MarkdownViewer

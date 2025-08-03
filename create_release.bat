@@ -9,9 +9,10 @@ mkdir "release\tc-markdown-viewer" 2>nul
 
 echo Copying plugin files...
 
-REM Copy the compiled plugin (assuming it exists)
+REM Copy the compiled plugin and rename to 64-bit extension
 if exist "tc_markdown_lister.wlx" (
-    copy "tc_markdown_lister.wlx" "release\tc-markdown-viewer\" >nul
+    copy "tc_markdown_lister.wlx" "release\tc-markdown-viewer\tc_markdown_lister.wlx64" >nul
+    echo Plugin copied as tc_markdown_lister.wlx64 (64-bit only)
 ) else (
     echo Warning: tc_markdown_lister.wlx not found. Run build_plugin_fixed.bat first.
 )
