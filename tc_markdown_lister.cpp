@@ -8,9 +8,9 @@
 //     notified with WM_APP_RENDER_DONE.
 //   * The page is loaded with Navigate(file://...) rather than
 //     NavigateToString, which is limited to 2 MB of content.
-//   * maddy is regex based and super-linear in line length (a single 20 KB
-//     line takes minutes), so EstimateMaddyCost() decides whether to render
-//     rich Markdown or fall back to escaped plain text.
+//   * Markdown is converted with md4c (vendored in include/md4c, compiled in
+//     statically). It is linear time: 20 MB in ~0.5 s, even as a single line.
+//     The previous parser, maddy, took ~12 s/MB and minutes on long lines.
 
 #include <windows.h>
 #include <shlobj.h>
@@ -22,10 +22,12 @@
 #include <iomanip>
 #include <map>
 #include <memory>
-#include <sstream>
 #include <string>
+#include <vector>
 #include "WebView2.h"
-#include "include/maddy/parser.h"
+extern "C" {
+#include "include/md4c/md4c-html.h"
+}
 
 using Microsoft::WRL::Callback;
 using Microsoft::WRL::ComPtr;
@@ -34,18 +36,16 @@ using Microsoft::WRL::ComPtr;
 // Tunables
 // ---------------------------------------------------------------------------
 
-// Estimated maddy run time (seconds) above which we show plain text instead.
-static const double kMaxMaddySeconds = 3.0;
-// Measured maddy cost model (x64 /O2): ~12 us per byte for normal short-line
-// text, plus a quadratic term for the part of a line beyond kMaddyQuadFreeLen
-// (single 2 KB line = 2.4 s, 5 KB = 13 s, 20 KB = 140 s).
-static const double kMaddyLinearSecPerByte = 12e-6;
-static const double kMaddyQuadSecPerByte2 = 0.73e-6;
-static const size_t kMaddyQuadFreeLen = 200;
-// Files larger than this are truncated (plain text view) to bound memory use.
+// Files larger than this are truncated (the first part is still rendered) to
+// bound memory use: the HTML is ~2.5x the Markdown size, and the browser DOM more.
 static const size_t kMaxDisplayBytes = 64u * 1024u * 1024u;
-// Worker stack reservation; std::regex in MSVC recurses deeply.
-static const SIZE_T kWorkerStackReserve = 64u * 1024u * 1024u;
+// md4c parser flags: GitHub dialect = tables, strikethrough, task lists, autolinks.
+static const unsigned kMd4cParserFlags = MD_DIALECT_GITHUB;
+// Documents at least this big are rendered in independent chunks (see SplitMarkdown).
+static const size_t kChunkThreshold = 512u * 1024u;
+static const size_t kChunkBytes = 64u * 1024u;
+// Worker stack reservation (generous; md4c itself does not recurse deeply).
+static const SIZE_T kWorkerStackReserve = 8u * 1024u * 1024u;
 
 #define WM_APP_RENDER_DONE (WM_APP + 1)
 
@@ -184,26 +184,64 @@ bool ReadFileUtf8(const std::wstring& path, std::string& out, bool& truncated, u
     return true;
 }
 
-// Estimated maddy run time in seconds (see cost model constants above).
-static double MaddyLineCost(size_t len) {
-    double excess = len > kMaddyQuadFreeLen ? (double)(len - kMaddyQuadFreeLen) : 0.0;
-    return kMaddyLinearSecPerByte * len + kMaddyQuadSecPerByte2 * excess * excess;
+static void Md4cAppend(const MD_CHAR* text, MD_SIZE size, void* userdata) {
+    static_cast<std::string*>(userdata)->append(text, size);
 }
 
-// Stops counting once the budget is exceeded.
-double EstimateMaddyCost(const std::string& s) {
-    double cost = 0;
-    size_t lineLen = 0;
-    for (char c : s) {
-        if (c == '\n') {
-            cost += MaddyLineCost(lineLen);
-            lineLen = 0;
-            if (cost > kMaxMaddySeconds) return cost;
-        } else {
-            lineLen++;
+static bool IsFenceLine(const char* p, const char* end) {
+    while (p < end && *p == ' ') p++;
+    return end - p >= 3 && ((p[0] == '`' && p[1] == '`' && p[2] == '`') || (p[0] == '~' && p[1] == '~' && p[2] == '~'));
+}
+
+// Splits Markdown into chunks of roughly kChunkBytes at blank lines that are
+// outside code fences and not followed by indented (continuation) text.
+// Chunks are parsed independently; the cost is that a construct spanning a
+// split point (e.g. a reference-style link defined in another chunk) may not
+// resolve. Only used for documents larger than kChunkThreshold.
+std::vector<std::pair<size_t, size_t>> SplitMarkdown(const std::string& md) {
+    std::vector<std::pair<size_t, size_t>> chunks;
+    const char* base = md.data();
+    size_t n = md.size(), start = 0, pos = 0;
+    bool inFence = false, prevBlank = false;
+    while (pos < n) {
+        size_t eol = md.find('\n', pos);
+        size_t next = (eol == std::string::npos) ? n : eol + 1;
+        const char* ls = base + pos;
+        const char* le = base + ((eol == std::string::npos) ? n : eol);
+        if (le > ls && le[-1] == '\r') le--;
+        bool blank = true;
+        for (const char* p = ls; p < le; p++)
+            if (*p != ' ' && *p != '\t') { blank = false; break; }
+        if (!blank && IsFenceLine(ls, le)) inFence = !inFence;
+        // Split before this line if: previous line blank, we're big enough, not in a
+        // fence, and this line starts a new top-level block (not indented).
+        if (prevBlank && !blank && !inFence && pos - start >= kChunkBytes && *ls != ' ' && *ls != '\t') {
+            chunks.emplace_back(start, pos - start);
+            start = pos;
         }
+        prevBlank = blank;
+        pos = next;
     }
-    return cost + MaddyLineCost(lineLen);
+    if (start < n) chunks.emplace_back(start, n - start);
+    return chunks;
+}
+
+// Markdown (UTF-8) -> HTML fragment, appended to out. Returns false on parser error.
+// Large documents are emitted as <section class="chunk"> blocks; with CSS
+// content-visibility:auto the browser skips layout of off-screen sections.
+bool MarkdownToHtml(const std::string& md, std::string& out) {
+    out.reserve(out.size() + md.size() * 5 / 2);
+    if (md.size() < kChunkThreshold)
+        return md_html(md.data(), (MD_SIZE)md.size(), Md4cAppend, &out, kMd4cParserFlags, 0) == 0;
+    auto chunks = SplitMarkdown(md);
+    DebugLog("Split into " + std::to_string(chunks.size()) + " chunks");
+    for (auto& c : chunks) {
+        out += "<section class=\"chunk\">\n";
+        if (md_html(md.data() + c.first, (MD_SIZE)c.second, Md4cAppend, &out, kMd4cParserFlags, 0) != 0)
+            return false;
+        out += "</section>\n";
+    }
+    return true;
 }
 
 static const char* kCss = R"CSS(
@@ -226,6 +264,10 @@ table tr:nth-child(2n) { background-color: #f6f8fa; }
 a { color: #0366d6; text-decoration: none; }
 a:hover { text-decoration: underline; }
 img { max-width: 100%; height: auto; }
+section.chunk { content-visibility: auto; contain-intrinsic-size: auto 4000px; }
+li.task-list-item { list-style-type: none; }
+li.task-list-item input { margin: 0 .3em 0 -1.3em; vertical-align: middle; }
+del { opacity: .7; }
 .notice { font-size: 90%; padding: 8px 12px; margin-bottom: 16px; border-radius: 4px;
           background: #fff8c5; border: 1px solid #d4a72c; color: #3b2e00; }
 .loading { color: #888; font-style: italic; }
@@ -277,41 +319,24 @@ std::string BuildDocumentHtml(const std::wstring& mdPath, bool dark) {
     }
     DebugLog("Read " + std::to_string(md.size()) + " bytes (file " + std::to_string(fileSize) + ")");
 
-    bool rich = !truncated;
-    double estimate = 0;
-    if (rich) {
-        estimate = EstimateMaddyCost(md);
-        rich = estimate <= kMaxMaddySeconds;
-        DebugLog("maddy cost estimate: " + std::to_string(estimate) + " s, rich=" + (rich ? "1" : "0"));
-    }
-
-    if (rich) {
-        try {
-            auto config = std::make_shared<maddy::ParserConfig>();
-            maddy::Parser parser(config);
-            std::stringstream mdStream(md);
-            html += parser.Parse(mdStream);
-            html += "\n</body></html>";
-            return html;
-        } catch (const std::exception& e) {
-            DebugLog(std::string("maddy exception: ") + e.what());
-        } catch (...) {
-            DebugLog("maddy unknown exception");
-        }
-        // fall through to plain text
-    }
-
-    html += "<div class=\"notice\">";
     if (truncated) {
-        html += "File is " + FormatMB(fileSize) + "; showing the first " + FormatMB(kMaxDisplayBytes) +
-                " as plain text.";
-    } else {
-        html += "Large or complex file (" + FormatMB(fileSize) +
-                "): shown as plain text to keep Total Commander responsive.";
+        // Cut at the last line break so we don't end mid-line.
+        size_t nl = md.find_last_of('\n');
+        if (nl != std::string::npos) md.resize(nl + 1);
+        html += "<div class=\"notice\">File is " + FormatMB(fileSize) + "; showing only the first " +
+                FormatMB(kMaxDisplayBytes) + ".</div>\n";
     }
-    html += "</div>\n<pre class=\"plain\">";
-    AppendHtmlEscaped(html, md);
-    html += "</pre>\n</body></html>";
+
+    size_t before = html.size();
+    if (!MarkdownToHtml(md, html)) {
+        // md4c only fails on out-of-memory; show escaped text rather than nothing.
+        DebugLog("md4c failed, falling back to plain text");
+        html.resize(before);
+        html += "<pre class=\"plain\">";
+        AppendHtmlEscaped(html, md);
+        html += "</pre>";
+    }
+    html += "\n</body></html>";
     return html;
 }
 
@@ -417,6 +442,7 @@ struct RenderJob {
     std::wstring mdPath;
     std::wstring htmlPath;
     bool dark = false;
+    std::chrono::steady_clock::time_point started = std::chrono::steady_clock::now();
     std::atomic<bool> cancelled{false};
     std::atomic<bool> done{false};
     std::atomic<bool> ok{false};
@@ -586,6 +612,24 @@ void OnControllerCreated(HWND hwnd, ICoreWebView2Controller* ctl) {
             settings->put_IsZoomControlEnabled(TRUE);
             settings->put_AreDefaultContextMenusEnabled(TRUE);
         }
+#ifdef DEBUG_LOG
+        v.webview->add_NavigationCompleted(
+            Callback<ICoreWebView2NavigationCompletedEventHandler>(
+                [hwnd](ICoreWebView2*, ICoreWebView2NavigationCompletedEventArgs* args) -> HRESULT {
+                    BOOL ok = FALSE;
+                    args->get_IsSuccess(&ok);
+                    auto it = g_views.find(hwnd);
+                    double secs = 0;
+                    if (it != g_views.end() && it->second.job)
+                        secs = std::chrono::duration<double>(std::chrono::steady_clock::now() -
+                                                             it->second.job->started).count();
+                    DebugLog("NavigationCompleted success=" + std::to_string(ok) + " at " +
+                             std::to_string(secs) + " s after ListLoad");
+                    return S_OK;
+                })
+                .Get(),
+            nullptr);
+#endif
         // Runs on every document (unlike ExecuteScript, which only hit the first one).
         v.webview->AddScriptToExecuteOnDocumentCreated(kEscScript, nullptr);
         v.webview->add_WebMessageReceived(

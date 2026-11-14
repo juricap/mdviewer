@@ -98,85 +98,19 @@ if exist "%ProgramFiles%\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Bui
     exit /b 1
 )
 
-REM Download Maddy markdown parser if not exists
-if not exist "include\maddy\parser.h" (
-    echo Downloading Maddy markdown parser...
-    
-    REM Try PowerShell first
-    powershell -Command "Invoke-WebRequest -Uri 'https://github.com/progsource/maddy/archive/refs/heads/master.zip' -OutFile 'maddy.zip'"
-    
-    REM If PowerShell failed, try alternative methods
-    if not exist "maddy.zip" (
-        echo PowerShell failed, trying alternative download method...
-        
-        REM Try curl (available in Windows 10+)
-        curl -L -o maddy.zip "https://github.com/progsource/maddy/archive/refs/heads/master.zip"
-        
-        REM If curl also failed, try wget if available
-        if not exist "maddy.zip" (
-            wget -O maddy.zip "https://github.com/progsource/maddy/archive/refs/heads/master.zip"
-        )
-        
-        REM If all failed, show error
-        if not exist "maddy.zip" (
-            echo Error: Could not download Maddy markdown parser
-            echo Please manually download from: https://github.com/progsource/maddy/archive/refs/heads/master.zip
-            echo Save as 'maddy.zip' in this directory and run the script again
-            pause
-            exit /b 1
-        )
-    )
-    
-    REM Extract the archive
-    echo Extracting Maddy headers...
-    mkdir temp_maddy 2>nul
-    
-    REM Try PowerShell extraction first
-    powershell -Command "Expand-Archive -Path 'maddy.zip' -DestinationPath 'temp_maddy' -Force" 2>nul
-    
-    REM If PowerShell extraction failed, try tar (Windows 10+)
-    if not exist "temp_maddy\maddy-master" (
-        echo PowerShell extraction failed, trying tar...
-        tar -xf maddy.zip -C temp_maddy 2>nul
-    )
-    
-    REM If tar also failed, try manual PowerShell with different approach
-    if not exist "temp_maddy\maddy-master" (
-        echo Tar extraction failed, trying alternative PowerShell method...
-        powershell -Command "Add-Type -AssemblyName System.IO.Compression.FileSystem; [System.IO.Compression.ZipFile]::ExtractToDirectory('maddy.zip', 'temp_maddy')" 2>nul
-    )
-    
-    REM Copy headers to include directory
-    if exist "temp_maddy\maddy-master\include\maddy" (
-        echo Copying Maddy headers...
-        mkdir include 2>nul
-        xcopy temp_maddy\maddy-master\include\maddy include\maddy\ /E /I /Q
-        
-        REM Clean up
-        rmdir /s /q temp_maddy 2>nul
-        del maddy.zip 2>nul
-        
-        echo Maddy headers installed successfully
-    ) else (
-        echo Error: Maddy extraction failed
-        echo.
-        echo The maddy.zip file has been preserved for manual extraction.
-        echo Please:
-        echo 1. Manually extract maddy.zip
-        echo 2. Copy the include/maddy/ folder to this project's include/ directory
-        echo 3. Run this script again
-        echo.
-        pause
-        exit /b 1
-    )
+REM md4c Markdown parser is vendored in include\md4c (compiled in statically)
+if not exist "include\md4c\md4c.c" (
+    echo Error: include\md4c\md4c.c not found - md4c sources must be vendored in include\md4c
+    exit /b 1
 )
+set "MD4C_SRC=include\md4c\md4c.c include\md4c\md4c-html.c include\md4c\entity.c"
 
 echo Compiling DLL...
 
 REM Compile the DLL (Release build - no debug logging)
 echo Compiling Release version...
 cl /std:c++17 /EHsc /O2 /I"include" /I"packages\Microsoft.Web.WebView2\build\native\include" ^
-   tc_markdown_lister.cpp /LD /Fe:tc_markdown_lister.wlx ^
+   tc_markdown_lister.cpp %MD4C_SRC% /LD /Fe:tc_markdown_lister.wlx ^
    /link user32.lib kernel32.lib ole32.lib oleaut32.lib shell32.lib shlwapi.lib version.lib windowsapp.lib ^
    "packages\Microsoft.Web.WebView2\build\native\x64\WebView2LoaderStatic.lib"
 
@@ -187,7 +121,7 @@ if "%1"=="debug" (
     echo.
     echo Compiling Debug version with logging...
     cl /std:c++17 /EHsc /Od /Zi /DDEBUG_LOG /I"include" /I"packages\Microsoft.Web.WebView2\build\native\include" ^
-       tc_markdown_lister.cpp /LD /Fe:tc_markdown_lister_debug.wlx ^
+       tc_markdown_lister.cpp %MD4C_SRC% /LD /Fe:tc_markdown_lister_debug.wlx ^
        /link user32.lib kernel32.lib ole32.lib oleaut32.lib shell32.lib shlwapi.lib version.lib windowsapp.lib ^
        "packages\Microsoft.Web.WebView2\build\native\x64\WebView2LoaderStatic.lib"
 )
