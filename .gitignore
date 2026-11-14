@@ -39,3 +39,13 @@ Makefile
 # OS files
 .DS_Store
 Thumbs.db
+# Plugin binaries
+*.wlx
+*.wlx64
+
+# Test harness output
+tests/harness/out/
+
+# Obsidian per-user state
+obsidian/.obsidian/workspace*.json
+obsidian/.trash/

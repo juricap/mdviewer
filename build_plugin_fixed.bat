@@ -213,7 +213,7 @@ if %RELEASE_BUILD_RESULT% == 0 (
     echo 3. Add the plugin and configure file associations for .md files
     echo.
     echo Usage:
-    echo   build_plugin_fixed.bat        - Build release version (no logging)
+    echo   build_plugin_fixed.bat        - Build release version ^(no logging^)
     echo   build_plugin_fixed.bat debug  - Build both release and debug versions
     echo.
     echo The plugin will preview markdown files in Total Commander's lister.

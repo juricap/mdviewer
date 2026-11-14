@@ -1,160 +1,389 @@
+// Total Commander lister plugin (WLX) that renders Markdown via WebView2.
+//
+// Threading model (important - see obsidian/Large file freeze.md):
+//   * ListLoadW runs on Total Commander's UI thread and must return quickly.
+//     It only creates the host window and kicks off WebView2 creation.
+//   * Reading + parsing the file happens on a worker thread (RenderThread).
+//     The result is written to a temp .html file and the host window is
+//     notified with WM_APP_RENDER_DONE.
+//   * The page is loaded with Navigate(file://...) rather than
+//     NavigateToString, which is limited to 2 MB of content.
+//   * maddy is regex based and super-linear in line length (a single 20 KB
+//     line takes minutes), so EstimateMaddyCost() decides whether to render
+//     rich Markdown or fall back to escaped plain text.
+
 #include <windows.h>
-#include <string>
-#include <fstream>
-#include <sstream>
-#include <memory>
-#include <algorithm>
-#include <map>
-#include <chrono>
-#include <iomanip>
 #include <shlobj.h>
+#include <shlwapi.h>
 #include <wrl.h>
-#include <comdef.h>
+#include <atomic>
+#include <chrono>
+#include <fstream>
+#include <iomanip>
+#include <map>
+#include <memory>
+#include <sstream>
+#include <string>
 #include "WebView2.h"
 #include "include/maddy/parser.h"
 
 using Microsoft::WRL::Callback;
 using Microsoft::WRL::ComPtr;
 
-// Debug logging function (only active when DEBUG_LOG is defined)
+// ---------------------------------------------------------------------------
+// Tunables
+// ---------------------------------------------------------------------------
+
+// Estimated maddy run time (seconds) above which we show plain text instead.
+static const double kMaxMaddySeconds = 3.0;
+// Measured maddy cost model (x64 /O2): ~12 us per byte for normal short-line
+// text, plus a quadratic term for the part of a line beyond kMaddyQuadFreeLen
+// (single 2 KB line = 2.4 s, 5 KB = 13 s, 20 KB = 140 s).
+static const double kMaddyLinearSecPerByte = 12e-6;
+static const double kMaddyQuadSecPerByte2 = 0.73e-6;
+static const size_t kMaddyQuadFreeLen = 200;
+// Files larger than this are truncated (plain text view) to bound memory use.
+static const size_t kMaxDisplayBytes = 64u * 1024u * 1024u;
+// Worker stack reservation; std::regex in MSVC recurses deeply.
+static const SIZE_T kWorkerStackReserve = 64u * 1024u * 1024u;
+
+#define WM_APP_RENDER_DONE (WM_APP + 1)
+
+// ---------------------------------------------------------------------------
+// Logging (only active when DEBUG_LOG is defined)
+// ---------------------------------------------------------------------------
+
 void DebugLog(const std::string& message) {
 #ifdef DEBUG_LOG
     try {
         char tempPath[MAX_PATH];
         GetTempPathA(MAX_PATH, tempPath);
         std::string logPath = std::string(tempPath) + "tc_markdown_lister.log";
-        
         std::ofstream logFile(logPath, std::ios::app);
         if (logFile.is_open()) {
             auto now = std::chrono::system_clock::now();
-            auto time_t = std::chrono::system_clock::to_time_t(now);
-            auto tm = *std::localtime(&time_t);
-            
-            logFile << std::put_time(&tm, "%Y-%m-%d %H:%M:%S") << " - " << message << std::endl;
-            logFile.close();
+            auto t = std::chrono::system_clock::to_time_t(now);
+            std::tm tm{};
+            localtime_s(&tm, &t);
+            logFile << std::put_time(&tm, "%Y-%m-%d %H:%M:%S") << " [" << GetCurrentThreadId()
+                    << "] " << message << std::endl;
         }
     } catch (...) {
-        // Ignore logging errors
     }
+#else
+    (void)message;
 #endif
 }
 
-// Prepare WebView2 user data folder
-void PrepareWebView2UserData() {
-    char appdata[MAX_PATH]{};
-    if (SUCCEEDED(SHGetFolderPathA(NULL, CSIDL_LOCAL_APPDATA, NULL, 0, appdata))) {
-        std::string ud = std::string(appdata) + "\\TCMarkdownViewer";
-        CreateDirectoryA(ud.c_str(), NULL);
-        SetEnvironmentVariableA("WEBVIEW2_USER_DATA_FOLDER", ud.c_str());
-        DebugLog("WebView2 user data folder set to: " + ud);
-    } else {
-        DebugLog("Failed to get LOCALAPPDATA path for WebView2");
-    }
+// ---------------------------------------------------------------------------
+// String helpers
+// ---------------------------------------------------------------------------
+
+std::string WideToUtf8(const std::wstring& w) {
+    if (w.empty()) return {};
+    int n = WideCharToMultiByte(CP_UTF8, 0, w.data(), (int)w.size(), nullptr, 0, nullptr, nullptr);
+    std::string s(n, 0);
+    WideCharToMultiByte(CP_UTF8, 0, w.data(), (int)w.size(), &s[0], n, nullptr, nullptr);
+    return s;
 }
 
-// Detect if data contains UTF-8 BOM or is valid UTF-8
+std::wstring CodepageToWide(const char* s, UINT cp) {
+    if (!s || !*s) return {};
+    int n = MultiByteToWideChar(cp, 0, s, -1, nullptr, 0);
+    if (n <= 0) return {};
+    std::wstring w(n - 1, 0);
+    MultiByteToWideChar(cp, 0, s, -1, &w[0], n);
+    return w;
+}
+
+// Valid UTF-8 check. An incomplete sequence at the very end is accepted,
+// because the input may have been truncated to kMaxDisplayBytes.
 bool IsUtf8(const std::string& data) {
-    // Check for UTF-8 BOM
-    if (data.size() >= 3 && (unsigned char)data[0] == 0xEF && 
-        (unsigned char)data[1] == 0xBB && (unsigned char)data[2] == 0xBF) {
-        return true;
-    }
-    
-    // Simple UTF-8 validation heuristic
-    const unsigned char* bytes = (const unsigned char*)data.c_str();
-    size_t len = data.length();
-    
-    for (size_t i = 0; i < len; ) {
-        if (bytes[i] < 0x80) {
-            i++; // ASCII
-        } else if ((bytes[i] & 0xE0) == 0xC0) {
-            if (i + 1 >= len || (bytes[i + 1] & 0xC0) != 0x80) return false;
-            i += 2; // 2-byte UTF-8
-        } else if ((bytes[i] & 0xF0) == 0xE0) {
-            if (i + 2 >= len || (bytes[i + 1] & 0xC0) != 0x80 || (bytes[i + 2] & 0xC0) != 0x80) return false;
-            i += 3; // 3-byte UTF-8
-        } else if ((bytes[i] & 0xF8) == 0xF0) {
-            if (i + 3 >= len || (bytes[i + 1] & 0xC0) != 0x80 || (bytes[i + 2] & 0xC0) != 0x80 || (bytes[i + 3] & 0xC0) != 0x80) return false;
-            i += 4; // 4-byte UTF-8
-        } else {
-            return false; // Invalid UTF-8
+    const unsigned char* b = (const unsigned char*)data.data();
+    size_t len = data.size();
+    for (size_t i = 0; i < len;) {
+        size_t extra;
+        if (b[i] < 0x80) { i++; continue; }
+        else if ((b[i] & 0xE0) == 0xC0) extra = 1;
+        else if ((b[i] & 0xF0) == 0xE0) extra = 2;
+        else if ((b[i] & 0xF8) == 0xF0) extra = 3;
+        else return false;
+        for (size_t k = 1; k <= extra; k++) {
+            if (i + k >= len) return true;  // truncated tail
+            if ((b[i + k] & 0xC0) != 0x80) return false;
         }
+        i += extra + 1;
     }
     return true;
 }
 
-// Convert ANSI (system codepage) to UTF-8
 std::string AnsiToUtf8(const std::string& ansi) {
-    if (ansi.empty()) return std::string();
-    
-    // Convert ANSI to wide string using system codepage
-    int size_needed = MultiByteToWideChar(CP_ACP, 0, &ansi[0], (int)ansi.size(), NULL, 0);
-    std::wstring wstr(size_needed, 0);
-    MultiByteToWideChar(CP_ACP, 0, &ansi[0], (int)ansi.size(), &wstr[0], size_needed);
-    
-    // Convert wide string to UTF-8
-    size_needed = WideCharToMultiByte(CP_UTF8, 0, &wstr[0], (int)wstr.size(), NULL, 0, NULL, NULL);
-    std::string utf8(size_needed, 0);
-    WideCharToMultiByte(CP_UTF8, 0, &wstr[0], (int)wstr.size(), &utf8[0], size_needed, NULL, NULL);
-    
-    return utf8;
+    if (ansi.empty()) return {};
+    int n = MultiByteToWideChar(CP_ACP, 0, ansi.data(), (int)ansi.size(), nullptr, 0);
+    std::wstring w(n, 0);
+    MultiByteToWideChar(CP_ACP, 0, ansi.data(), (int)ansi.size(), &w[0], n);
+    return WideToUtf8(w);
 }
 
-// Read file and convert to UTF-8, supporting both UTF-8 and ANSI encodings
-std::string ReadAllUtf8(const std::wstring& wpath) {
-    FILE* f = _wfopen(wpath.c_str(), L"rb");
-    if (!f) {
-        DebugLog("ReadAllUtf8: Failed to open file");
-        return {};
-    }
-    
-    std::string data;
-    char buf[1 << 15];
-    size_t n;
-    while ((n = fread(buf, 1, sizeof(buf), f)) > 0) {
-        data.append(buf, n);
-    }
-    fclose(f);
-    
-    DebugLog("ReadAllUtf8: Read " + std::to_string(data.length()) + " bytes");
-    
-    // Check if the data is already UTF-8
-    if (IsUtf8(data)) {
-        // Remove UTF-8 BOM if present
-        if (data.size() >= 3 && (unsigned char)data[0] == 0xEF && 
-            (unsigned char)data[1] == 0xBB && (unsigned char)data[2] == 0xBF) {
-            data = data.substr(3);
-            DebugLog("ReadAllUtf8: Removed UTF-8 BOM");
+void AppendHtmlEscaped(std::string& out, const std::string& in) {
+    out.reserve(out.size() + in.size() + in.size() / 16);
+    for (char c : in) {
+        switch (c) {
+            case '&': out += "&amp;"; break;
+            case '<': out += "&lt;"; break;
+            case '>': out += "&gt;"; break;
+            case '"': out += "&quot;"; break;
+            default: out += c;
         }
-        DebugLog("ReadAllUtf8: File detected as UTF-8");
-        return data;
-    } else {
-        // Assume ANSI and convert to UTF-8
-        DebugLog("ReadAllUtf8: File detected as ANSI, converting to UTF-8");
-        return AnsiToUtf8(data);
     }
 }
 
-// Convert UTF-8 string to UTF-16 wide string
-std::wstring Utf8ToWide(const std::string& utf8) {
-    if (utf8.empty()) return std::wstring();
-    
-    int size_needed = MultiByteToWideChar(CP_UTF8, 0, &utf8[0], (int)utf8.size(), NULL, 0);
-    std::wstring wstrTo(size_needed, 0);
-    MultiByteToWideChar(CP_UTF8, 0, &utf8[0], (int)utf8.size(), &wstrTo[0], size_needed);
-    return wstrTo;
+std::wstring PathToFileUrl(const std::wstring& path) {
+    wchar_t url[4096];
+    DWORD len = 4096;
+    if (SUCCEEDED(UrlCreateFromPathW(path.c_str(), url, &len, 0))) return url;
+    return L"";
 }
 
-// WLX Plugin constants (from listplug.h)
-#define lc_copy   1
+// ---------------------------------------------------------------------------
+// File reading / HTML generation (runs on the worker thread)
+// ---------------------------------------------------------------------------
+
+// Reads up to kMaxDisplayBytes and converts to UTF-8 (UTF-8 or ANSI input).
+bool ReadFileUtf8(const std::wstring& path, std::string& out, bool& truncated, unsigned long long& fileSize) {
+    truncated = false;
+    fileSize = 0;
+    HANDLE h = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                           nullptr, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    LARGE_INTEGER sz{};
+    GetFileSizeEx(h, &sz);
+    fileSize = (unsigned long long)sz.QuadPart;
+    size_t toRead = (size_t)min((unsigned long long)kMaxDisplayBytes, fileSize);
+    truncated = fileSize > kMaxDisplayBytes;
+    std::string data(toRead, 0);
+    size_t got = 0;
+    while (got < toRead) {
+        DWORD chunk = (DWORD)min((size_t)(1u << 20), toRead - got);
+        DWORD n = 0;
+        if (!ReadFile(h, &data[got], chunk, &n, nullptr) || n == 0) break;
+        got += n;
+    }
+    CloseHandle(h);
+    data.resize(got);
+
+    if (data.size() >= 3 && (unsigned char)data[0] == 0xEF && (unsigned char)data[1] == 0xBB &&
+        (unsigned char)data[2] == 0xBF) {
+        data.erase(0, 3);
+        out.swap(data);
+    } else if (IsUtf8(data)) {
+        out.swap(data);
+    } else {
+        out = AnsiToUtf8(data);
+    }
+    return true;
+}
+
+// Estimated maddy run time in seconds (see cost model constants above).
+static double MaddyLineCost(size_t len) {
+    double excess = len > kMaddyQuadFreeLen ? (double)(len - kMaddyQuadFreeLen) : 0.0;
+    return kMaddyLinearSecPerByte * len + kMaddyQuadSecPerByte2 * excess * excess;
+}
+
+// Stops counting once the budget is exceeded.
+double EstimateMaddyCost(const std::string& s) {
+    double cost = 0;
+    size_t lineLen = 0;
+    for (char c : s) {
+        if (c == '\n') {
+            cost += MaddyLineCost(lineLen);
+            lineLen = 0;
+            if (cost > kMaxMaddySeconds) return cost;
+        } else {
+            lineLen++;
+        }
+    }
+    return cost + MaddyLineCost(lineLen);
+}
+
+static const char* kCss = R"CSS(
+body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; padding: 20px;
+       max-width: 900px; margin: 0 auto; line-height: 1.6; color: #333; background: white; }
+h1, h2, h3, h4, h5, h6 { margin-top: 24px; margin-bottom: 16px; font-weight: 600; }
+h1 { font-size: 2em; border-bottom: 1px solid #eaecef; padding-bottom: .3em; }
+h2 { font-size: 1.5em; border-bottom: 1px solid #eaecef; padding-bottom: .3em; }
+h3 { font-size: 1.25em; }
+code { background-color: rgba(27,31,35,.05); padding: .2em .4em; margin: 0; font-size: 85%;
+       border-radius: 3px; font-family: Consolas, 'Courier New', monospace; }
+pre { background-color: #f6f8fa; padding: 16px; overflow: auto; font-size: 85%; line-height: 1.45; border-radius: 3px; }
+pre code { background-color: transparent; padding: 0; }
+pre.plain { white-space: pre-wrap; word-break: break-word; background: transparent; padding: 0;
+            font-family: Consolas, 'Courier New', monospace; }
+blockquote { margin: 0; padding: 0 1em; color: #6a737d; border-left: .25em solid #dfe2e5; }
+table { border-spacing: 0; border-collapse: collapse; margin-top: 0; margin-bottom: 16px; }
+table th, table td { padding: 6px 13px; border: 1px solid #dfe2e5; }
+table tr:nth-child(2n) { background-color: #f6f8fa; }
+a { color: #0366d6; text-decoration: none; }
+a:hover { text-decoration: underline; }
+img { max-width: 100%; height: auto; }
+.notice { font-size: 90%; padding: 8px 12px; margin-bottom: 16px; border-radius: 4px;
+          background: #fff8c5; border: 1px solid #d4a72c; color: #3b2e00; }
+.loading { color: #888; font-style: italic; }
+body.dark { background: #0d1117; color: #f0f6fc; }
+.dark h1, .dark h2 { border-bottom-color: #30363d; }
+.dark code { background-color: rgba(110,118,129,.4); }
+.dark pre { background-color: #161b22; }
+.dark pre.plain { background: transparent; }
+.dark table th, .dark table td { border-color: #30363d; }
+.dark table tr:nth-child(2n) { background-color: #161b22; }
+.dark blockquote { color: #8b949e; border-left-color: #30363d; }
+.dark a { color: #58a6ff; }
+.dark .notice { background: #272115; border-color: #9e6a03; color: #e3b341; }
+)CSS";
+
+std::string HtmlHead(const std::wstring& baseDirUrl) {
+    std::string h = "<!DOCTYPE html>\n<html><head><meta charset=\"UTF-8\">\n";
+    if (!baseDirUrl.empty()) {
+        h += "<base href=\"";
+        AppendHtmlEscaped(h, WideToUtf8(baseDirUrl));
+        h += "\">\n";
+    }
+    h += "<style>";
+    h += kCss;
+    h += "</style></head>\n";
+    return h;
+}
+
+std::string BodyOpen(bool dark) { return dark ? "<body class=\"dark\">\n" : "<body>\n"; }
+
+std::string FormatMB(unsigned long long bytes) {
+    char buf[32];
+    sprintf_s(buf, "%.1f MB", bytes / (1024.0 * 1024.0));
+    return buf;
+}
+
+std::string BuildDocumentHtml(const std::wstring& mdPath, bool dark) {
+    std::wstring dir = mdPath;
+    size_t slash = dir.find_last_of(L"\\/");
+    dir = (slash == std::wstring::npos) ? L"" : dir.substr(0, slash + 1);
+    std::string html = HtmlHead(dir.empty() ? L"" : PathToFileUrl(dir)) + BodyOpen(dark);
+
+    std::string md;
+    bool truncated = false;
+    unsigned long long fileSize = 0;
+    if (!ReadFileUtf8(mdPath, md, truncated, fileSize)) {
+        html += "<p>Error: could not open file.</p></body></html>";
+        return html;
+    }
+    DebugLog("Read " + std::to_string(md.size()) + " bytes (file " + std::to_string(fileSize) + ")");
+
+    bool rich = !truncated;
+    double estimate = 0;
+    if (rich) {
+        estimate = EstimateMaddyCost(md);
+        rich = estimate <= kMaxMaddySeconds;
+        DebugLog("maddy cost estimate: " + std::to_string(estimate) + " s, rich=" + (rich ? "1" : "0"));
+    }
+
+    if (rich) {
+        try {
+            auto config = std::make_shared<maddy::ParserConfig>();
+            maddy::Parser parser(config);
+            std::stringstream mdStream(md);
+            html += parser.Parse(mdStream);
+            html += "\n</body></html>";
+            return html;
+        } catch (const std::exception& e) {
+            DebugLog(std::string("maddy exception: ") + e.what());
+        } catch (...) {
+            DebugLog("maddy unknown exception");
+        }
+        // fall through to plain text
+    }
+
+    html += "<div class=\"notice\">";
+    if (truncated) {
+        html += "File is " + FormatMB(fileSize) + "; showing the first " + FormatMB(kMaxDisplayBytes) +
+                " as plain text.";
+    } else {
+        html += "Large or complex file (" + FormatMB(fileSize) +
+                "): shown as plain text to keep Total Commander responsive.";
+    }
+    html += "</div>\n<pre class=\"plain\">";
+    AppendHtmlEscaped(html, md);
+    html += "</pre>\n</body></html>";
+    return html;
+}
+
+std::wstring LoadingHtml(bool dark) {
+    std::string h = HtmlHead(L"") + BodyOpen(dark) + "<p class=\"loading\">Loading&hellip;</p></body></html>";
+    return CodepageToWide(h.c_str(), CP_UTF8);
+}
+
+// ---------------------------------------------------------------------------
+// Temp files
+// ---------------------------------------------------------------------------
+
+std::wstring GetDataDir() {
+    wchar_t appdata[MAX_PATH]{};
+    if (FAILED(SHGetFolderPathW(nullptr, CSIDL_LOCAL_APPDATA, nullptr, 0, appdata))) return L"";
+    std::wstring d = std::wstring(appdata) + L"\\TCMarkdownViewer";
+    CreateDirectoryW(d.c_str(), nullptr);
+    return d;
+}
+
+std::wstring GetRenderDir() {
+    std::wstring d = GetDataDir();
+    if (d.empty()) return L"";
+    d += L"\\render";
+    CreateDirectoryW(d.c_str(), nullptr);
+    return d;
+}
+
+// Remove render files left behind (e.g. by a crash) that are older than a day.
+void CleanupStaleRenders(const std::wstring& dir) {
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileW((dir + L"\\*.html").c_str(), &fd);
+    if (h == INVALID_HANDLE_VALUE) return;
+    FILETIME nowFt;
+    GetSystemTimeAsFileTime(&nowFt);
+    ULONGLONG now = ((ULONGLONG)nowFt.dwHighDateTime << 32) | nowFt.dwLowDateTime;
+    const ULONGLONG day = 24ull * 3600ull * 10000000ull;
+    do {
+        ULONGLONG t = ((ULONGLONG)fd.ftLastWriteTime.dwHighDateTime << 32) | fd.ftLastWriteTime.dwLowDateTime;
+        if (now > t && now - t > day) DeleteFileW((dir + L"\\" + fd.cFileName).c_str());
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+}
+
+bool WriteAllBytes(const std::wstring& path, const std::string& data) {
+    HANDLE h = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    size_t done = 0;
+    bool ok = true;
+    while (done < data.size()) {
+        DWORD chunk = (DWORD)min((size_t)(1u << 20), data.size() - done);
+        DWORD n = 0;
+        if (!WriteFile(h, data.data() + done, chunk, &n, nullptr) || n == 0) { ok = false; break; }
+        done += n;
+    }
+    CloseHandle(h);
+    return ok;
+}
+
+// ---------------------------------------------------------------------------
+// WLX constants (from listplug.h)
+// ---------------------------------------------------------------------------
+
+#define lc_copy 1
 #define lc_newparams 2
 #define lc_selectall 3
 #define lc_setpercent 4
 
 #define lcp_wraptext 1
 #define lcp_fittowindow 2
-#define lcp_ansi   4
-#define lcp_ascii   8
+#define lcp_ansi 4
+#define lcp_ascii 8
 #define lcp_variable 12
 #define lcp_forceshow 16
 #define lcp_fitlargeronly 32
@@ -177,732 +406,375 @@ typedef struct {
     char DefaultIniName[MAX_PATH];
 } ListDefaultParamStruct;
 
-// Global variables
+// ---------------------------------------------------------------------------
+// Per-window state
+// ---------------------------------------------------------------------------
+
 HINSTANCE g_hInstance = nullptr;
 
-// WebView2 structure
+// Shared between UI thread and worker thread.
+struct RenderJob {
+    std::wstring mdPath;
+    std::wstring htmlPath;
+    bool dark = false;
+    std::atomic<bool> cancelled{false};
+    std::atomic<bool> done{false};
+    std::atomic<bool> ok{false};
+};
+
+// UI-thread only.
 struct View2 {
     ComPtr<ICoreWebView2Controller> controller;
     ComPtr<ICoreWebView2> webview;
+    std::shared_ptr<RenderJob> job;
+    bool navigated = false;
 };
 
-// Store WebView2 instances for cleanup
 static std::map<HWND, View2> g_views;
 
-// HTML template for the markdown preview
-const char* HTML_TEMPLATE = R"(
-<!DOCTYPE html>
-<html>
-<head>
-    <meta charset="UTF-8">
-    <style>
-        body { 
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-            padding: 20px;
-            max-width: 900px;
-            margin: 0 auto;
-            line-height: 1.6;
-            color: #333;
-            background: white;
+// Navigate to the rendered file once both the WebView and the render are ready.
+void TryShowRendered(HWND hwnd) {
+    auto it = g_views.find(hwnd);
+    if (it == g_views.end()) return;
+    View2& v = it->second;
+    if (v.navigated || !v.webview || !v.job || !v.job->done) return;
+    v.navigated = true;
+    if (v.job->ok) {
+        std::wstring url = PathToFileUrl(v.job->htmlPath);
+        HRESULT hr = v.webview->Navigate(url.c_str());
+        DebugLog("Navigate to rendered file, hr=" + std::to_string(hr));
+    } else {
+        v.webview->NavigateToString(L"<html><body><p>Error: could not render file.</p></body></html>");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Worker thread
+// ---------------------------------------------------------------------------
+
+struct ThreadArg {
+    std::shared_ptr<RenderJob> job;
+    HWND hwnd;
+    HMODULE module;  // extra reference so the DLL can't unload under us
+};
+
+DWORD WINAPI RenderThread(LPVOID param) {
+    ThreadArg* arg = static_cast<ThreadArg*>(param);
+    HMODULE module = arg->module;
+    {
+        std::shared_ptr<RenderJob> job = arg->job;
+        HWND hwnd = arg->hwnd;
+        delete arg;
+
+        auto t0 = std::chrono::steady_clock::now();
+        std::string html;
+        try {
+            html = BuildDocumentHtml(job->mdPath, job->dark);
+        } catch (...) {
+            html = "<html><body><p>Error: failed to render file.</p></body></html>";
         }
-        h1, h2, h3, h4, h5, h6 { 
-            margin-top: 24px;
-            margin-bottom: 16px;
-            font-weight: 600;
+        DebugLog("Render took " +
+                 std::to_string(std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count()) +
+                 " s, html " + std::to_string(html.size()) + " bytes");
+
+        if (!job->cancelled) {
+            job->ok = WriteAllBytes(job->htmlPath, html);
+            job->done = true;
+            if (job->cancelled) {
+                DeleteFileW(job->htmlPath.c_str());  // window closed while writing
+            } else {
+                PostMessage(hwnd, WM_APP_RENDER_DONE, 0, 0);
+            }
         }
-        h1 { font-size: 2em; border-bottom: 1px solid #eaecef; padding-bottom: .3em; }
-        h2 { font-size: 1.5em; border-bottom: 1px solid #eaecef; padding-bottom: .3em; }
-        h3 { font-size: 1.25em; }
-        code {
-            background-color: rgba(27,31,35,.05);
-            padding: .2em .4em;
-            margin: 0;
-            font-size: 85%;
-            border-radius: 3px;
-            font-family: Consolas, 'Courier New', monospace;
+    }  // all destructors run before the module reference is dropped
+    FreeLibraryAndExitThread(module, 0);
+    return 0;
+}
+
+bool StartRender(HWND hwnd, const std::shared_ptr<RenderJob>& job) {
+    HMODULE module = nullptr;
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, (LPCWSTR)&RenderThread, &module)) return false;
+    ThreadArg* arg = new ThreadArg{job, hwnd, module};
+    HANDLE th = CreateThread(nullptr, kWorkerStackReserve, RenderThread, arg, STACK_SIZE_PARAM_IS_A_RESERVATION, nullptr);
+    if (!th) {
+        delete arg;
+        FreeLibrary(module);
+        return false;
+    }
+    CloseHandle(th);
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Host window
+// ---------------------------------------------------------------------------
+
+LRESULT CALLBACK HostWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) {
+    switch (message) {
+        case WM_SIZE: {
+            auto it = g_views.find(hWnd);
+            if (it != g_views.end() && it->second.controller) {
+                RECT rc{};
+                GetClientRect(hWnd, &rc);
+                it->second.controller->put_Bounds(rc);
+            }
+            break;
         }
-        pre {
-            background-color: #f6f8fa;
-            padding: 16px;
-            overflow: auto;
-            font-size: 85%;
-            line-height: 1.45;
-            border-radius: 3px;
-        }
-        pre code {
-            background-color: transparent;
-            padding: 0;
-        }
-        blockquote {
-            margin: 0;
-            padding: 0 1em;
-            color: #6a737d;
-            border-left: .25em solid #dfe2e5;
-        }
-        table {
-            border-spacing: 0;
-            border-collapse: collapse;
-            margin-top: 0;
-            margin-bottom: 16px;
-        }
-        table th, table td {
-            padding: 6px 13px;
-            border: 1px solid #dfe2e5;
-        }
-        table tr:nth-child(2n) {
-            background-color: #f6f8fa;
-        }
-        a {
-            color: #0366d6;
-            text-decoration: none;
-        }
-        a:hover {
-            text-decoration: underline;
-        }
-        img {
-            max-width: 100%;
-            height: auto;
-        }
-        body.dark {
-            background: #0d1117;
-            color: #f0f6fc;
-        }
-        .dark h1, .dark h2 {
-            border-bottom-color: #30363d;
-        }
-        .dark code {
-            background-color: rgba(110,118,129,.4);
-        }
-        .dark pre {
-            background-color: #161b22;
-        }
-        .dark table th, .dark table td {
-            border-color: #30363d;
-        }
-        .dark table tr:nth-child(2n) {
-            background-color: #161b22;
-        }
-        .dark blockquote {
-            color: #8b949e;
-            border-left-color: #30363d;
-        }
-        .dark a {
-            color: #58a6ff;
-        }
-    </style>
-</head>
-<body>
-%CONTENT%
-</body>
-</html>
+        case WM_APP_RENDER_DONE:
+            TryShowRendered(hWnd);
+            return 0;
+        case WM_KEYDOWN:
+            if (wParam == VK_ESCAPE) {
+                HWND parent = GetParent(hWnd);
+                if (parent) PostMessage(parent, WM_CLOSE, 0, 0);
+                return 0;
+            }
+            break;
+    }
+    return DefWindowProc(hWnd, message, wParam, lParam);
+}
+
+static const wchar_t* kHostClass = L"TCMarkdownViewer";
+
+bool EnsureHostClass() {
+    static bool registered = false;
+    if (registered) return true;
+    WNDCLASSEXW wc = {0};
+    wc.cbSize = sizeof(wc);
+    wc.lpfnWndProc = HostWndProc;
+    wc.hInstance = g_hInstance;
+    wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+    wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+    wc.lpszClassName = kHostClass;
+    registered = RegisterClassExW(&wc) != 0 || GetLastError() == ERROR_CLASS_ALREADY_EXISTS;
+    return registered;
+}
+
+bool IsMarkdownFile(const std::wstring& path) {
+    const wchar_t* ext = PathFindExtensionW(path.c_str());
+    static const wchar_t* exts[] = {L".md", L".markdown", L".mdown", L".mkd", L".mkdn"};
+    for (auto e : exts)
+        if (_wcsicmp(ext, e) == 0) return true;
+    return false;
+}
+
+static const wchar_t* kEscScript = LR"(
+document.addEventListener('keydown', function(event) {
+    if (event.key === 'Escape') window.chrome.webview.postMessage('ESC_PRESSED');
+});
 )";
 
-// Convert markdown file to HTML (wide string version)
-std::string ConvertMarkdownToHtml(const std::wstring& wfilePath) {
-    try {
-        // Convert wide path to UTF-8 for logging
-        int len = WideCharToMultiByte(CP_UTF8, 0, wfilePath.c_str(), -1, nullptr, 0, nullptr, nullptr);
-        std::string logPath(len - 1, 0);
-        WideCharToMultiByte(CP_UTF8, 0, wfilePath.c_str(), -1, &logPath[0], len, nullptr, nullptr);
-        
-        DebugLog("ConvertMarkdownToHtml: Opening file: " + logPath);
-        
-        std::string mdContent = ReadAllUtf8(wfilePath);
-        if (mdContent.empty()) {
-            DebugLog("ConvertMarkdownToHtml: Failed to read file or file is empty");
-            return "<html><body><p>Error: Could not open file or file is empty</p></body></html>";
-        }
-        
-        DebugLog("ConvertMarkdownToHtml: Read " + std::to_string(mdContent.length()) + " bytes");
-        
-        // Parse Markdown to HTML
-        std::shared_ptr<maddy::ParserConfig> config = std::make_shared<maddy::ParserConfig>();
-        std::stringstream mdStream(mdContent);
-        maddy::Parser parser(config);
-        std::string html = parser.Parse(mdStream);
-        
-        DebugLog("ConvertMarkdownToHtml: Parsed HTML length: " + std::to_string(html.length()));
-        
-        // Replace placeholder in template
-        std::string result = HTML_TEMPLATE;
-        size_t pos = result.find("%CONTENT%");
-        if (pos != std::string::npos) {
-            result.replace(pos, 9, html);
-        }
-        
-        DebugLog("ConvertMarkdownToHtml: Final HTML length: " + std::to_string(result.length()));
-        
-        return result;
-    } catch (const std::exception& e) {
-        DebugLog("ConvertMarkdownToHtml: Exception: " + std::string(e.what()));
-        return "<html><body><p>Error: Failed to parse markdown</p></body></html>";
-    } catch (...) {
-        DebugLog("ConvertMarkdownToHtml: Unknown exception");
-        return "<html><body><p>Error: Failed to parse markdown</p></body></html>";
+void OnControllerCreated(HWND hwnd, ICoreWebView2Controller* ctl) {
+    auto it = g_views.find(hwnd);
+    if (it == g_views.end()) {
+        // Lister was closed before WebView2 finished initialising.
+        ctl->Close();
+        return;
     }
-}
+    View2& v = it->second;
+    v.controller = ctl;
+    ctl->get_CoreWebView2(&v.webview);
 
-// Convert markdown file to HTML (narrow string version - for backward compatibility)
-std::string ConvertMarkdownToHtml(const char* filePath) {
-    // Convert narrow path to wide string and call the wide version
-    int len = MultiByteToWideChar(CP_UTF8, 0, filePath, -1, nullptr, 0);
-    if (len <= 0) {
-        DebugLog("ConvertMarkdownToHtml: Failed to convert narrow path to wide");
-        return "<html><body><p>Error: Invalid file path</p></body></html>";
+    RECT rc{};
+    GetClientRect(hwnd, &rc);
+    ctl->put_Bounds(rc);
+
+    if (v.webview) {
+        ComPtr<ICoreWebView2Settings> settings;
+        v.webview->get_Settings(&settings);
+        if (settings) {
+            settings->put_IsZoomControlEnabled(TRUE);
+            settings->put_AreDefaultContextMenusEnabled(TRUE);
+        }
+        // Runs on every document (unlike ExecuteScript, which only hit the first one).
+        v.webview->AddScriptToExecuteOnDocumentCreated(kEscScript, nullptr);
+        v.webview->add_WebMessageReceived(
+            Callback<ICoreWebView2WebMessageReceivedEventHandler>(
+                [hwnd](ICoreWebView2*, ICoreWebView2WebMessageReceivedEventArgs* args) -> HRESULT {
+                    LPWSTR message = nullptr;
+                    if (SUCCEEDED(args->TryGetWebMessageAsString(&message)) && message) {
+                        if (wcscmp(message, L"ESC_PRESSED") == 0) {
+                            HWND parent = GetParent(hwnd);
+                            if (parent) PostMessage(parent, WM_CLOSE, 0, 0);
+                        }
+                        CoTaskMemFree(message);
+                    }
+                    return S_OK;
+                })
+                .Get(),
+            nullptr);
+
+        if (v.job && v.job->done) {
+            TryShowRendered(hwnd);
+        } else {
+            v.webview->NavigateToString(LoadingHtml(v.job && v.job->dark).c_str());
+        }
     }
-    
-    std::wstring wfilePath(len - 1, 0);
-    MultiByteToWideChar(CP_UTF8, 0, filePath, -1, &wfilePath[0], len);
-    
-    return ConvertMarkdownToHtml(wfilePath);
+    ctl->MoveFocus(COREWEBVIEW2_MOVE_FOCUS_REASON_PROGRAMMATIC);
 }
 
-// Check if file is a markdown file
-bool IsMarkdownFile(const char* filename) {
-    if (!filename) return false;
-    
-    std::string file(filename);
-    std::transform(file.begin(), file.end(), file.begin(), ::tolower);
-    
-    // Manual string ending check for C++17 compatibility
-    return (file.length() >= 3 && file.substr(file.length() - 3) == ".md") ||
-           (file.length() >= 9 && file.substr(file.length() - 9) == ".markdown") ||
-           (file.length() >= 6 && file.substr(file.length() - 6) == ".mdown") ||
-           (file.length() >= 4 && file.substr(file.length() - 4) == ".mkd") ||
-           (file.length() >= 5 && file.substr(file.length() - 5) == ".mkdn");
+HWND CreateLister(HWND parentWin, const std::wstring& path, int showFlags) {
+    DebugLog("ListLoad: " + WideToUtf8(path) + " flags=" + std::to_string(showFlags));
+    if (!(showFlags & lcp_forceshow) && !IsMarkdownFile(path)) return nullptr;
+
+    CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    if (!EnsureHostClass()) return nullptr;
+
+    std::wstring dataDir = GetDataDir();
+    std::wstring renderDir = GetRenderDir();
+    if (renderDir.empty()) return nullptr;
+    static bool cleaned = false;
+    if (!cleaned) {
+        CleanupStaleRenders(renderDir);
+        cleaned = true;
+    }
+
+    RECT pr{};
+    GetClientRect(parentWin, &pr);
+    HWND hwnd = CreateWindowExW(0, kHostClass, L"", WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN, 0, 0,
+                                pr.right - pr.left, pr.bottom - pr.top, parentWin, nullptr, g_hInstance, nullptr);
+    if (!hwnd) return nullptr;
+
+    static std::atomic<unsigned> counter{0};
+    auto job = std::make_shared<RenderJob>();
+    job->mdPath = path;
+    job->dark = (showFlags & lcp_darkmode) != 0;
+    job->htmlPath = renderDir + L"\\view_" + std::to_wstring(GetCurrentProcessId()) + L"_" +
+                    std::to_wstring(++counter) + L".html";
+    g_views[hwnd].job = job;
+
+    if (!StartRender(hwnd, job)) {
+        DebugLog("Failed to start render thread");
+        g_views.erase(hwnd);
+        DestroyWindow(hwnd);
+        return nullptr;
+    }
+
+    HRESULT hr = CreateCoreWebView2EnvironmentWithOptions(
+        nullptr, dataDir.c_str(), nullptr,
+        Callback<ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler>(
+            [hwnd](HRESULT envHr, ICoreWebView2Environment* env) -> HRESULT {
+                if (FAILED(envHr) || !env) {
+                    DebugLog("WebView2 environment failed: " + std::to_string(envHr));
+                    return S_OK;
+                }
+                if (g_views.find(hwnd) == g_views.end()) return S_OK;  // already closed
+                env->CreateCoreWebView2Controller(
+                    hwnd, Callback<ICoreWebView2CreateCoreWebView2ControllerCompletedHandler>(
+                              [hwnd](HRESULT ctlHr, ICoreWebView2Controller* ctl) -> HRESULT {
+                                  if (FAILED(ctlHr) || !ctl) {
+                                      DebugLog("WebView2 controller failed: " + std::to_string(ctlHr));
+                                      return S_OK;
+                                  }
+                                  OnControllerCreated(hwnd, ctl);
+                                  return S_OK;
+                              })
+                              .Get());
+                return S_OK;
+            })
+            .Get());
+    if (FAILED(hr)) DebugLog("CreateCoreWebView2EnvironmentWithOptions failed: " + std::to_string(hr));
+
+    return hwnd;
 }
 
-// Required WLX API functions - remove declarations since they're in the header
+// JSON string literal for embedding in scripts.
+std::wstring JsString(const std::wstring& s) {
+    std::wstring r = L"\"";
+    for (wchar_t c : s) {
+        switch (c) {
+            case L'"': r += L"\\\""; break;
+            case L'\\': r += L"\\\\"; break;
+            case L'\n': r += L"\\n"; break;
+            case L'\r': r += L"\\r"; break;
+            default:
+                if (c < 0x20) {
+                    wchar_t buf[8];
+                    swprintf_s(buf, L"\\u%04x", c);
+                    r += buf;
+                } else {
+                    r += c;
+                }
+        }
+    }
+    return r + L"\"";
+}
+
+ICoreWebView2* WebViewFor(HWND w) {
+    auto it = g_views.find(w);
+    return it == g_views.end() ? nullptr : it->second.webview.Get();
+}
+
+// ---------------------------------------------------------------------------
+// Exported WLX API
+// ---------------------------------------------------------------------------
+
 extern "C" {
 
-__declspec(dllexport) HWND __stdcall ListLoad(HWND ParentWin, char* FileToLoad, int ShowFlags) {
-    DebugLog("ListLoad called with file: " + std::string(FileToLoad ? FileToLoad : "NULL"));
-    DebugLog("ListLoad ShowFlags: " + std::to_string(ShowFlags) + " (lcp_forceshow=" + std::to_string(lcp_forceshow) + ")");
-    
-    // Check if force show is enabled (user explicitly chose plugin)
-    if (!(ShowFlags & lcp_forceshow)) {
-        // Normal mode - check if this is a markdown file
-        bool isMarkdown = IsMarkdownFile(FileToLoad);
-        DebugLog("IsMarkdownFile result: " + std::string(isMarkdown ? "true" : "false"));
-        if (!isMarkdown) {
-            DebugLog("ListLoad returning NULL - not a markdown file");
-            return nullptr;
-        }
-    } else {
-        DebugLog("Force show enabled - attempting to load file regardless");
-    }
-    
-    // Initialize COM
-    CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
-    
-    // Convert markdown to HTML
-    std::string html = ConvertMarkdownToHtml(FileToLoad);
-    
+__declspec(dllexport) HWND __stdcall ListLoadW(HWND ParentWin, WCHAR* FileToLoad, int ShowFlags) {
+    if (!FileToLoad) return nullptr;
     try {
-        // Get parent window dimensions
-        RECT parentRect;
-        GetClientRect(ParentWin, &parentRect);
-        int width = parentRect.right - parentRect.left;
-        int height = parentRect.bottom - parentRect.top;
-        
-        DebugLog("Parent window dimensions: " + std::to_string(width) + "x" + std::to_string(height));
-        
-        // Window procedure for webview host
-        static auto WebViewWndProc = [](HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) -> LRESULT {
-            auto it = g_views.find(hWnd);
-            
-            switch (message) {
-                case WM_SIZE: {
-                    // Handle resize for WebView2
-                    if (it != g_views.end() && it->second.controller) {
-                        RECT rc{};
-                        GetClientRect(hWnd, &rc);
-                        it->second.controller->put_Bounds(rc);
-                        DebugLog("Resized WebView2 to: " + std::to_string(rc.right - rc.left) + "x" + std::to_string(rc.bottom - rc.top));
-                    }
-                    break;
-                }
-                case WM_KEYDOWN: {
-                    // Handle ESC key to close the lister window
-                    if (wParam == VK_ESCAPE) {
-                        DebugLog("ESC key pressed - closing lister window");
-                        // Send close message to parent lister window
-                        HWND parent = GetParent(hWnd);
-                        if (parent) {
-                            PostMessage(parent, WM_COMMAND, MAKEWPARAM(0, 0), 0);
-                        }
-                        return 0;
-                    }
-                    break;
-                }
-                case WM_DESTROY: {
-                    // Cleanup is handled in ListCloseWindow
-                    break;
-                }
-            }
-            return DefWindowProc(hWnd, message, wParam, lParam);
-        };
-        
-        // Register window class for our webview host
-        static bool classRegistered = false;
-        if (!classRegistered) {
-            WNDCLASSEX wc = {0};
-            wc.cbSize = sizeof(WNDCLASSEX);
-            wc.lpfnWndProc = WebViewWndProc;
-            wc.hInstance = g_hInstance;
-            wc.hCursor = LoadCursor(NULL, IDC_ARROW);
-            wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
-            wc.lpszClassName = "TCMarkdownViewer";
-            
-            if (RegisterClassEx(&wc)) {
-                classRegistered = true;
-            }
-        }
-        
-        // Create a child window to host the webview
-        HWND hwnd = CreateWindowEx(
-            0,
-            "TCMarkdownViewer",
-            "",
-            WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN,
-            0, 0, width, height,
-            ParentWin,
-            nullptr,
-            g_hInstance,
-            nullptr
-        );
-        
-        if (!hwnd) {
-            DebugLog("Failed to create child window: " + std::to_string(GetLastError()));
-            return nullptr;
-        }
-        
-        DebugLog("Child window created successfully");
-        
-        // Prepare WebView2 user data folder before creating webview
-        PrepareWebView2UserData();
-        
-        DebugLog("Creating WebView2 directly");
-        
-        // Capture HTML content for the lambda
-        std::string htmlCopy = html;
-        
-        // Create WebView2 environment and controller asynchronously
-        CreateCoreWebView2EnvironmentWithOptions(
-            nullptr, // browser exe
-            _wgetenv(L"WEBVIEW2_USER_DATA_FOLDER"), // user data folder set by PrepareWebView2UserData
-            nullptr,
-            Callback<ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler>(
-                [hwnd, htmlCopy](HRESULT envHr, ICoreWebView2Environment* env) -> HRESULT {
-                    if (FAILED(envHr) || !env) {
-                        DebugLog("Failed to create WebView2 environment: " + std::to_string(envHr));
-                        return S_OK;
-                    }
-                    
-                    DebugLog("WebView2 environment created successfully");
-                    
-                    // Create controller bound to our child window
-                    env->CreateCoreWebView2Controller(
-                        hwnd,
-                        Callback<ICoreWebView2CreateCoreWebView2ControllerCompletedHandler>(
-                            [hwnd, htmlCopy](HRESULT ctlHr, ICoreWebView2Controller* ctl) -> HRESULT {
-                                if (FAILED(ctlHr) || !ctl) {
-                                    DebugLog("Failed to create WebView2 controller: " + std::to_string(ctlHr));
-                                    return S_OK;
-                                }
-                                
-                                DebugLog("WebView2 controller created successfully");
-                                
-                                g_views[hwnd].controller = ctl;
-                                ctl->get_CoreWebView2(&g_views[hwnd].webview);
-                                
-                                // Size it to our client rect
-                                RECT rc{};
-                                GetClientRect(hwnd, &rc);
-                                ctl->put_Bounds(rc);
-                                
-                                // Enable default context menus/zoom on the webview
-                                if (g_views[hwnd].webview) {
-                                    ComPtr<ICoreWebView2Settings> settings;
-                                    g_views[hwnd].webview->get_Settings(&settings);
-                                    if (settings) {
-                                        settings->put_IsZoomControlEnabled(TRUE);
-                                        settings->put_AreDefaultContextMenusEnabled(TRUE);
-                                    }
-                                }
-                                
-                                // Feed HTML directly
-                                if (g_views[hwnd].webview) {
-                                    std::wstring whtml = Utf8ToWide(htmlCopy);
-                                    g_views[hwnd].webview->NavigateToString(whtml.c_str());
-                                    DebugLog("WebView2 HTML content set, length: " + std::to_string(htmlCopy.length()));
-                                    
-                                    // Add JavaScript to handle ESC key
-                                    std::wstring escScript = LR"(
-                                        document.addEventListener('keydown', function(event) {
-                                            if (event.key === 'Escape') {
-                                                console.log('ESC key pressed in WebView2');
-                                                window.chrome.webview.postMessage('ESC_PRESSED');
-                                            }
-                                        });
-                                    )";
-                                    
-                                    // Add message handler for ESC key
-                                    g_views[hwnd].webview->add_WebMessageReceived(
-                                        Callback<ICoreWebView2WebMessageReceivedEventHandler>(
-                                            [hwnd](ICoreWebView2* sender, ICoreWebView2WebMessageReceivedEventArgs* args) -> HRESULT {
-                                                LPWSTR message;
-                                                args->TryGetWebMessageAsString(&message);
-                                                if (wcscmp(message, L"ESC_PRESSED") == 0) {
-                                                    DebugLog("ESC key received from WebView2 - closing lister");
-                                                    // Send close message to Total Commander
-                                                    HWND parent = GetParent(hwnd);
-                                                    if (parent) {
-                                                        PostMessage(parent, WM_CLOSE, 0, 0);
-                                                    }
-                                                }
-                                                CoTaskMemFree(message);
-                                                return S_OK;
-                                            }
-                                        ).Get(), nullptr);
-                                    
-                                    // Execute the ESC handler script
-                                    g_views[hwnd].webview->ExecuteScript(escScript.c_str(), nullptr);
-                                }
-                                
-                                // Set focus to the WebView2 control for immediate keyboard navigation
-                                ctl->MoveFocus(COREWEBVIEW2_MOVE_FOCUS_REASON_PROGRAMMATIC);
-                                DebugLog("WebView2 focus set for keyboard navigation");
-                                
-                                return S_OK;
-                            }
-                        ).Get()
-                    );
-                    return S_OK;
-                }
-            ).Get()
-        );
-        
-        DebugLog("ListLoad completed successfully, returning window handle");
-        return hwnd;
-    } catch (const std::exception& e) {
-        DebugLog("Exception in ListLoad: " + std::string(e.what()));
-        return nullptr;
+        return CreateLister(ParentWin, FileToLoad, ShowFlags);
     } catch (...) {
-        DebugLog("Unknown exception in ListLoad");
+        DebugLog("Exception in ListLoadW");
         return nullptr;
     }
 }
 
-__declspec(dllexport) HWND __stdcall ListLoadW(HWND ParentWin, WCHAR* FileToLoad, int ShowFlags) {
-    // Convert wide path to UTF-8 for logging
-    int len = WideCharToMultiByte(CP_UTF8, 0, FileToLoad, -1, nullptr, 0, nullptr, nullptr);
-    std::string logPath;
-    if (len > 0) {
-        logPath.resize(len - 1);
-        WideCharToMultiByte(CP_UTF8, 0, FileToLoad, -1, &logPath[0], len, nullptr, nullptr);
-    }
-    
-    DebugLog("ListLoadW called with file: " + logPath);
-    DebugLog("ListLoadW ShowFlags: " + std::to_string(ShowFlags) + " (lcp_forceshow=" + std::to_string(lcp_forceshow) + ")");
-    
-    // Check if force show is enabled (user explicitly chose plugin)
-    if (!(ShowFlags & lcp_forceshow)) {
-        // Normal mode - check if this is a markdown file
-        bool isMarkdown = IsMarkdownFile(logPath.c_str());
-        DebugLog("IsMarkdownFile result: " + std::string(isMarkdown ? "true" : "false"));
-        if (!isMarkdown) {
-            DebugLog("ListLoadW returning NULL - not a markdown file");
-            return nullptr;
-        }
-    } else {
-        DebugLog("Force show enabled - attempting to load file regardless");
-    }
-    
-    // Initialize COM
-    CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
-    
-    // Convert markdown to HTML using wide string version
-    std::wstring wfilePath(FileToLoad);
-    std::string html = ConvertMarkdownToHtml(wfilePath);
-    
-    try {
-        // Get parent window dimensions
-        RECT parentRect;
-        GetClientRect(ParentWin, &parentRect);
-        int width = parentRect.right - parentRect.left;
-        int height = parentRect.bottom - parentRect.top;
-        
-        DebugLog("Parent window dimensions: " + std::to_string(width) + "x" + std::to_string(height));
-        
-        // Window procedure for webview host
-        static auto WebViewWndProc = [](HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) -> LRESULT {
-            auto it = g_views.find(hWnd);
-            
-            switch (message) {
-                case WM_SIZE: {
-                    // Handle resize for WebView2
-                    if (it != g_views.end() && it->second.controller) {
-                        RECT rc{};
-                        GetClientRect(hWnd, &rc);
-                        it->second.controller->put_Bounds(rc);
-                        DebugLog("Resized WebView2 to: " + std::to_string(rc.right - rc.left) + "x" + std::to_string(rc.bottom - rc.top));
-                    }
-                    break;
-                }
-                case WM_KEYDOWN: {
-                    // Handle ESC key to close the lister window
-                    if (wParam == VK_ESCAPE) {
-                        DebugLog("ESC key pressed - closing lister window");
-                        // Send close message to parent lister window
-                        HWND parent = GetParent(hWnd);
-                        if (parent) {
-                            PostMessage(parent, WM_COMMAND, MAKEWPARAM(0, 0), 0);
-                        }
-                        return 0;
-                    }
-                    break;
-                }
-                case WM_DESTROY: {
-                    // Cleanup is handled in ListCloseWindow
-                    break;
-                }
-            }
-            return DefWindowProc(hWnd, message, wParam, lParam);
-        };
-        
-        // Register window class for our webview host
-        static bool classRegistered = false;
-        if (!classRegistered) {
-            WNDCLASSEX wc = {0};
-            wc.cbSize = sizeof(WNDCLASSEX);
-            wc.lpfnWndProc = WebViewWndProc;
-            wc.hInstance = g_hInstance;
-            wc.hCursor = LoadCursor(NULL, IDC_ARROW);
-            wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
-            wc.lpszClassName = "TCMarkdownViewer";
-            
-            if (RegisterClassEx(&wc)) {
-                classRegistered = true;
-            }
-        }
-        
-        // Create a child window to host the webview
-        HWND hwnd = CreateWindowEx(
-            0,
-            "TCMarkdownViewer",
-            "",
-            WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN,
-            0, 0, width, height,
-            ParentWin,
-            nullptr,
-            g_hInstance,
-            nullptr
-        );
-        
-        if (!hwnd) {
-            DebugLog("Failed to create child window: " + std::to_string(GetLastError()));
-            return nullptr;
-        }
-        
-        DebugLog("Child window created successfully");
-        
-        // Prepare WebView2 user data folder before creating webview
-        PrepareWebView2UserData();
-        
-        DebugLog("Creating WebView2 directly");
-        
-        // Capture HTML content for the lambda
-        std::string htmlCopy = html;
-        
-        // Create WebView2 environment and controller asynchronously
-        CreateCoreWebView2EnvironmentWithOptions(
-            nullptr, // browser exe
-            _wgetenv(L"WEBVIEW2_USER_DATA_FOLDER"), // user data folder set by PrepareWebView2UserData
-            nullptr,
-            Callback<ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler>(
-                [hwnd, htmlCopy](HRESULT envHr, ICoreWebView2Environment* env) -> HRESULT {
-                    if (FAILED(envHr) || !env) {
-                        DebugLog("Failed to create WebView2 environment: " + std::to_string(envHr));
-                        return S_OK;
-                    }
-                    
-                    DebugLog("WebView2 environment created successfully");
-                    
-                    // Create controller bound to our child window
-                    env->CreateCoreWebView2Controller(
-                        hwnd,
-                        Callback<ICoreWebView2CreateCoreWebView2ControllerCompletedHandler>(
-                            [hwnd, htmlCopy](HRESULT ctlHr, ICoreWebView2Controller* ctl) -> HRESULT {
-                                if (FAILED(ctlHr) || !ctl) {
-                                    DebugLog("Failed to create WebView2 controller: " + std::to_string(ctlHr));
-                                    return S_OK;
-                                }
-                                
-                                DebugLog("WebView2 controller created successfully");
-                                
-                                g_views[hwnd].controller = ctl;
-                                ctl->get_CoreWebView2(&g_views[hwnd].webview);
-                                
-                                // Size it to our client rect
-                                RECT rc{};
-                                GetClientRect(hwnd, &rc);
-                                ctl->put_Bounds(rc);
-                                
-                                // Enable default context menus/zoom on the webview
-                                if (g_views[hwnd].webview) {
-                                    ComPtr<ICoreWebView2Settings> settings;
-                                    g_views[hwnd].webview->get_Settings(&settings);
-                                    if (settings) {
-                                        settings->put_IsZoomControlEnabled(TRUE);
-                                        settings->put_AreDefaultContextMenusEnabled(TRUE);
-                                    }
-                                }
-                                
-                                // Feed HTML directly
-                                if (g_views[hwnd].webview) {
-                                    std::wstring whtml = Utf8ToWide(htmlCopy);
-                                    g_views[hwnd].webview->NavigateToString(whtml.c_str());
-                                    DebugLog("WebView2 HTML content set, length: " + std::to_string(htmlCopy.length()));
-                                    
-                                    // Add JavaScript to handle ESC key
-                                    std::wstring escScript = LR"(
-                                        document.addEventListener('keydown', function(event) {
-                                            if (event.key === 'Escape') {
-                                                console.log('ESC key pressed in WebView2');
-                                                window.chrome.webview.postMessage('ESC_PRESSED');
-                                            }
-                                        });
-                                    )";
-                                    
-                                    // Add message handler for ESC key
-                                    g_views[hwnd].webview->add_WebMessageReceived(
-                                        Callback<ICoreWebView2WebMessageReceivedEventHandler>(
-                                            [hwnd](ICoreWebView2* sender, ICoreWebView2WebMessageReceivedEventArgs* args) -> HRESULT {
-                                                LPWSTR message;
-                                                args->TryGetWebMessageAsString(&message);
-                                                if (wcscmp(message, L"ESC_PRESSED") == 0) {
-                                                    DebugLog("ESC key received from WebView2 - closing lister");
-                                                    // Send close message to Total Commander
-                                                    HWND parent = GetParent(hwnd);
-                                                    if (parent) {
-                                                        PostMessage(parent, WM_CLOSE, 0, 0);
-                                                    }
-                                                }
-                                                CoTaskMemFree(message);
-                                                return S_OK;
-                                            }
-                                        ).Get(), nullptr);
-                                    
-                                    // Execute the ESC handler script
-                                    g_views[hwnd].webview->ExecuteScript(escScript.c_str(), nullptr);
-                                }
-                                
-                                // Set focus to the WebView2 control for immediate keyboard navigation
-                                ctl->MoveFocus(COREWEBVIEW2_MOVE_FOCUS_REASON_PROGRAMMATIC);
-                                DebugLog("WebView2 focus set for keyboard navigation");
-                                
-                                return S_OK;
-                            }
-                        ).Get()
-                    );
-                    return S_OK;
-                }
-            ).Get()
-        );
-        
-        DebugLog("ListLoadW completed successfully, returning window handle");
-        return hwnd;
-    } catch (const std::exception& e) {
-        DebugLog("Exception in ListLoadW: " + std::string(e.what()));
-        return nullptr;
-    } catch (...) {
-        DebugLog("Unknown exception in ListLoadW");
-        return nullptr;
-    }
+__declspec(dllexport) HWND __stdcall ListLoad(HWND ParentWin, char* FileToLoad, int ShowFlags) {
+    // TC passes the ANSI path in the system codepage.
+    std::wstring w = CodepageToWide(FileToLoad, CP_ACP);
+    if (w.empty()) return nullptr;
+    return ListLoadW(ParentWin, &w[0], ShowFlags);
 }
 
 __declspec(dllexport) void __stdcall ListCloseWindow(HWND ListWin) {
-    if (ListWin && IsWindow(ListWin)) {
-        // Clean up WebView2 instance
-        auto it = g_views.find(ListWin);
-        if (it != g_views.end()) {
-            if (it->second.controller) {
-                it->second.controller->Close();
-            }
-            g_views.erase(it);
+    auto it = g_views.find(ListWin);
+    if (it != g_views.end()) {
+        if (it->second.job) {
+            it->second.job->cancelled = true;
+            if (it->second.job->done) DeleteFileW(it->second.job->htmlPath.c_str());
         }
-        DestroyWindow(ListWin);
+        if (it->second.controller) it->second.controller->Close();
+        g_views.erase(it);
     }
-}
-
-// Simple string copy function like the official example
-char* strlcpy(char* p, const char* p2, int maxlen) {
-    if ((int)strlen(p2) >= maxlen) {
-        strncpy(p, p2, maxlen - 1);
-        p[maxlen - 1] = 0;
-    } else {
-        strcpy(p, p2);
-    }
-    return p;
+    if (ListWin && IsWindow(ListWin)) DestroyWindow(ListWin);
 }
 
 __declspec(dllexport) void __stdcall ListGetDetectString(char* DetectString, int maxlen) {
-    DebugLog("ListGetDetectString called with maxlen=" + std::to_string(maxlen));
-    
-    // Use MULTIMEDIA to override internal viewers and support multiple markdown extensions
+    // MULTIMEDIA overrides TC's internal viewer for these extensions.
     const char* detectStr = "MULTIMEDIA & (EXT=\"MD\" | EXT=\"MARKDOWN\" | EXT=\"MDOWN\" | EXT=\"MKD\" | EXT=\"MKDN\")";
-    strlcpy(DetectString, detectStr, maxlen);
-    
-    DebugLog("ListGetDetectString returning: " + std::string(DetectString));
-}
-
-__declspec(dllexport) int __stdcall ListSearchText(HWND ListWin, char* SearchString, int SearchParameter) {
-    // Basic search implementation
-    if (!ListWin || !SearchString) return LISTPLUGIN_ERROR;
-    
-    // Get text from the control
-    int textLen = GetWindowTextLengthA(ListWin);
-    if (textLen <= 0) return LISTPLUGIN_ERROR;
-    
-    std::string text(textLen + 1, 0);
-    GetWindowTextA(ListWin, &text[0], textLen + 1);
-    
-    // Simple case-insensitive search
-    std::string searchStr(SearchString);
-    if (!(SearchParameter & lcs_matchcase)) {
-        std::transform(text.begin(), text.end(), text.begin(), ::tolower);
-        std::transform(searchStr.begin(), searchStr.end(), searchStr.begin(), ::tolower);
-    }
-    
-    size_t pos = text.find(searchStr);
-    if (pos != std::string::npos) {
-        // Select found text
-        SendMessage(ListWin, EM_SETSEL, pos, pos + searchStr.length());
-        return LISTPLUGIN_OK;
-    }
-    
-    return LISTPLUGIN_ERROR;
+    strncpy_s(DetectString, maxlen, detectStr, _TRUNCATE);
 }
 
 __declspec(dllexport) int __stdcall ListSearchTextW(HWND ListWin, WCHAR* SearchString, int SearchParameter) {
-    // Convert wide string to narrow string
-    int len = WideCharToMultiByte(CP_UTF8, 0, SearchString, -1, nullptr, 0, nullptr, nullptr);
-    if (len <= 0) return LISTPLUGIN_ERROR;
-    
-    std::string narrowSearch(len - 1, 0);
-    WideCharToMultiByte(CP_UTF8, 0, SearchString, -1, &narrowSearch[0], len, nullptr, nullptr);
-    
-    return ListSearchText(ListWin, &narrowSearch[0], SearchParameter);
+    ICoreWebView2* wv = WebViewFor(ListWin);
+    if (!wv || !SearchString) return LISTPLUGIN_ERROR;
+    // window.find(text, caseSensitive, backwards, wrapAround, wholeWord)
+    std::wstring script = L"window.find(" + JsString(SearchString) + L"," +
+                          ((SearchParameter & lcs_matchcase) ? L"true" : L"false") + L"," +
+                          ((SearchParameter & lcs_backwards) ? L"true" : L"false") + L",true," +
+                          ((SearchParameter & lcs_wholewords) ? L"true" : L"false") + L")";
+    if (SearchParameter & lcs_findfirst) script = L"window.getSelection().removeAllRanges();" + script;
+    wv->ExecuteScript(script.c_str(), nullptr);
+    return LISTPLUGIN_OK;
+}
+
+__declspec(dllexport) int __stdcall ListSearchText(HWND ListWin, char* SearchString, int SearchParameter) {
+    std::wstring w = CodepageToWide(SearchString, CP_ACP);
+    if (w.empty()) return LISTPLUGIN_ERROR;
+    return ListSearchTextW(ListWin, &w[0], SearchParameter);
 }
 
 __declspec(dllexport) int __stdcall ListSendCommand(HWND ListWin, int Command, int Parameter) {
+    ICoreWebView2* wv = WebViewFor(ListWin);
+    if (!wv) return LISTPLUGIN_ERROR;
     switch (Command) {
         case lc_copy:
-            SendMessage(ListWin, WM_COPY, 0, 0);
+            wv->ExecuteScript(L"document.execCommand('copy')", nullptr);
             return LISTPLUGIN_OK;
         case lc_selectall:
-            SendMessage(ListWin, EM_SETSEL, 0, -1);
+            wv->ExecuteScript(L"document.execCommand('selectAll')", nullptr);
             return LISTPLUGIN_OK;
         default:
             return LISTPLUGIN_ERROR;
@@ -910,107 +782,42 @@ __declspec(dllexport) int __stdcall ListSendCommand(HWND ListWin, int Command, i
 }
 
 __declspec(dllexport) void __stdcall ListSetDefaultParams(ListDefaultParamStruct* dps) {
-    DebugLog("ListSetDefaultParams called");
-    
-    // Initialize default parameters
     if (dps) {
-        DebugLog("ListSetDefaultParams: size=" + std::to_string(dps->size));
-        DebugLog("ListSetDefaultParams: VersionHi=" + std::to_string(dps->PluginInterfaceVersionHi));
-        DebugLog("ListSetDefaultParams: VersionLow=" + std::to_string(dps->PluginInterfaceVersionLow));
-        DebugLog("ListSetDefaultParams: DefaultIniName=" + std::string(dps->DefaultIniName));
-        
         dps->PluginInterfaceVersionLow = 11;
         dps->PluginInterfaceVersionHi = 2;
         strcpy_s(dps->DefaultIniName, "tc_markdown.ini");
-    } else {
-        DebugLog("ListSetDefaultParams: dps is NULL");
     }
 }
 
-// Optional functions - return error for now
-__declspec(dllexport) int __stdcall ListLoadNext(HWND ParentWin, HWND PluginWin, char* FileToLoad, int ShowFlags) {
-    return LISTPLUGIN_ERROR;
-}
-
-__declspec(dllexport) int __stdcall ListLoadNextW(HWND ParentWin, HWND PluginWin, WCHAR* FileToLoad, int ShowFlags) {
-    return LISTPLUGIN_ERROR;
-}
-
-__declspec(dllexport) int __stdcall ListSearchDialog(HWND ListWin, int FindNext) {
-    return LISTPLUGIN_ERROR;
-}
-
-__declspec(dllexport) int __stdcall ListPrint(HWND ListWin, char* FileToPrint, char* DefPrinter, int PrintFlags, RECT* Margins) {
-    return LISTPLUGIN_ERROR;
-}
-
-__declspec(dllexport) int __stdcall ListPrintW(HWND ListWin, WCHAR* FileToPrint, WCHAR* DefPrinter, int PrintFlags, RECT* Margins) {
-    return LISTPLUGIN_ERROR;
-}
+__declspec(dllexport) int __stdcall ListLoadNext(HWND, HWND, char*, int) { return LISTPLUGIN_ERROR; }
+__declspec(dllexport) int __stdcall ListLoadNextW(HWND, HWND, WCHAR*, int) { return LISTPLUGIN_ERROR; }
+__declspec(dllexport) int __stdcall ListSearchDialog(HWND, int) { return LISTPLUGIN_ERROR; }
+__declspec(dllexport) int __stdcall ListPrint(HWND, char*, char*, int, RECT*) { return LISTPLUGIN_ERROR; }
+__declspec(dllexport) int __stdcall ListPrintW(HWND, WCHAR*, WCHAR*, int, RECT*) { return LISTPLUGIN_ERROR; }
 
 __declspec(dllexport) int __stdcall ListNotificationReceived(HWND ListWin, int Message, WPARAM wParam, LPARAM lParam) {
-    switch (Message) {
-        case WM_SIZE: {
-            // Resize the window to fit the parent
-            RECT rect;
-            GetClientRect(GetParent(ListWin), &rect);
-            SetWindowPos(ListWin, NULL, 0, 0, rect.right - rect.left, rect.bottom - rect.top, SWP_NOMOVE | SWP_NOZORDER);
-            DebugLog("ListNotificationReceived: Window resized to: " + std::to_string(rect.right - rect.left) + "x" + std::to_string(rect.bottom - rect.top));
-            
-            // Also update the WebView2 size
-            auto it = g_views.find(ListWin);
-            if (it != g_views.end() && it->second.controller) {
-                it->second.controller->put_Bounds(rect);
-            }
-            
-            return 0;
-        }
-        case WM_MOUSEWHEEL:
-        case WM_MOUSEHWHEEL:
-        case WM_KEYDOWN:
-        case WM_KEYUP: {
-            // Handle ESC key to close the lister window
-            if (Message == WM_KEYDOWN && wParam == VK_ESCAPE) {
-                DebugLog("ESC key pressed in ListNotificationReceived - closing lister");
-                // Post WM_CLOSE to the lister window to close it
-                PostMessage(GetParent(ListWin), WM_CLOSE, 0, 0);
-                return 0;
-            }
-            
-            // Forward other input messages to the webview window
-            SendMessage(ListWin, Message, wParam, lParam);
-            
-            // WebView2 handles input automatically - no manual dispatch needed
-            
-            return 0;
-        }
-        default:
-            break;
+    if (Message == WM_SIZE) {
+        RECT rect;
+        GetClientRect(GetParent(ListWin), &rect);
+        SetWindowPos(ListWin, nullptr, 0, 0, rect.right - rect.left, rect.bottom - rect.top, SWP_NOMOVE | SWP_NOZORDER);
+        auto it = g_views.find(ListWin);
+        if (it != g_views.end() && it->second.controller) it->second.controller->put_Bounds(rect);
+    } else if (Message == WM_KEYDOWN && wParam == VK_ESCAPE) {
+        PostMessage(GetParent(ListWin), WM_CLOSE, 0, 0);
     }
+    (void)lParam;
     return 0;
 }
 
-__declspec(dllexport) HBITMAP __stdcall ListGetPreviewBitmap(char* FileToLoad, int width, int height, char* contentbuf, int contentbuflen) {
-    return nullptr;
-}
+__declspec(dllexport) HBITMAP __stdcall ListGetPreviewBitmap(char*, int, int, char*, int) { return nullptr; }
+__declspec(dllexport) HBITMAP __stdcall ListGetPreviewBitmapW(WCHAR*, int, int, char*, int) { return nullptr; }
 
-__declspec(dllexport) HBITMAP __stdcall ListGetPreviewBitmapW(WCHAR* FileToLoad, int width, int height, char* contentbuf, int contentbuflen) {
-    return nullptr;
-}
+}  // extern "C"
 
-} // extern "C"
-
-// DLL Entry Point
-BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserved) {
-    switch (ul_reason_for_call) {
-        case DLL_PROCESS_ATTACH:
-            g_hInstance = hModule;
-            DisableThreadLibraryCalls(hModule);
-            DebugLog("DLL_PROCESS_ATTACH - Plugin loaded");
-            break;
-        case DLL_PROCESS_DETACH:
-            DebugLog("DLL_PROCESS_DETACH - Plugin unloaded");
-            break;
+BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
+    if (reason == DLL_PROCESS_ATTACH) {
+        g_hInstance = hModule;
+        DisableThreadLibraryCalls(hModule);
     }
     return TRUE;
 }
