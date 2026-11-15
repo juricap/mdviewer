@@ -1,5 +1,9 @@
 # Large file freeze
 
+> **Superseded 2026-11-15:** the WebView2 renderer described below was replaced by the built-in
+> litehtml renderer with virtualized chunks (see [[Architecture]], [[Status]]). It is kept as history.
+> With litehtml, a 20 MB file shows its first screen in ~0.1 s (WebView2: 1.5 s first screen, 6 s full load).
+
 Back to [[mdviewer]] · see [[Status]], [[TODO]].
 
 **Reported 2026-11-14:** opening a 10–20 MB `.md` file freezes all of Total Commander. The

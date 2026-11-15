@@ -3,38 +3,38 @@
 Back to [[mdviewer]] · history in [[Status]].
 
 ## Now
-- [ ] **Test in real Total Commander** (F3 and Ctrl+Q quick view) with 10–20 MB files, rapid
-      cursor movement in quick view, and closing while "Loading…" is shown.
-- [x] Replace maddy with md4c (vendored, static). See [[Large file freeze]].
-- [ ] Decide whether to keep the **WebView2** runtime (a system component) or move to a fully
-      self-contained renderer. See "Renderer options" below.
-- [ ] Rebuild the release zip (`create_release.bat`) once verified.
+- [ ] **Test in real Total Commander** (F3, Ctrl+Q quick view with cursor movement, F7 search,
+      Esc, dark mode, 20 MB file, links). Install from `artifacts\release\mdview-0.3.0.zip`.
+- [ ] Test the same `mdview.wlx64` in **Double Commander** on Windows.
+- [ ] Decide how **aicmd** hosts it: helper executable (aicmd's viewer convention, crash
+      isolation) or linked library. Then add the protocol/CLI that aicmd needs.
 
-## Renderer options (open question)
-- **Keep WebView2** (current): full HTML/CSS, runs in a separate process (a renderer crash can't
-  take down TC), but needs the Edge WebView2 runtime installed.
-- **Native rendering** (e.g. md4c → RichEdit/RTF, or a custom GDI/DirectWrite renderer driven by
-  md4c's parser callbacks): no runtime dependency and very small, but limited styling and a lot
-  more code for tables and images. It also runs inside TC's process.
+## Viewer features
+- [ ] **Text selection and copy.** Today Ctrl+A, Ctrl+C copies the whole Markdown source; there
+      is no partial selection. litehtml has no selection support, so it has to be built on its
+      text elements.
+- [ ] In-page anchors (`#heading`): generate heading ids and scroll to them.
+- [ ] Syntax highlighting in code blocks (a small built-in tokenizer → spans).
+- [ ] Images: JPEG/GIF on Linux (cairo decodes only PNG); size limits for huge images.
+- [ ] Settings: zoom, theme and font persisted (ini next to the plugin, or a host-provided setting).
+- [ ] Print (`ListPrintW`) and TC's "percent" status line.
+- [ ] Follow TC's lister options for dark mode automatically (`lcp_darkmode` is honoured; system
+      theme for standalone).
 
-## Next
-- [ ] Check `window.find()` search works across `content-visibility:auto` chunks in big files.
-- [ ] Read settings from `tc_markdown.ini` (truncation size, chunk threshold, dark mode). Today
-      the ini is shipped but nothing reads it.
-- [ ] `ListLoadNext(W)`: reuse the WebView when the quick-view cursor moves, instead of creating a
-      new environment and controller every time.
-- [ ] Share one `ICoreWebView2Environment` across lister windows.
-- [ ] Raw HTML in Markdown passes through and scripts can run. Consider a CSP or
-      `MD_FLAG_NOHTML` option.
-- [ ] Syntax highlighting for code blocks (vendored highlight.js).
-- [ ] Print (`ListPrintW` via `ICoreWebView2_16::Print`).
-- [ ] Links: open external links in the default browser instead of inside the lister.
-- [ ] Standalone `main.cpp`: switch to md4c too, or drop it.
+## Platforms
+- [ ] **Linux interactive frontend**: GTK3 window plus the **Double Commander Linux WLX** (DC
+      passes a GTK/Qt parent widget). Same cairo container.
+- [ ] macOS: a CoreGraphics/CoreText container, or cairo via Homebrew.
+- [ ] 32-bit `mdview.wlx` for 32-bit TC (the CMake suffix logic exists; untested).
+
+## Robustness
+- [ ] Fuzz `split_markdown` and the find code with random input.
+- [ ] Consider running litehtml out-of-process for hosts that need crash isolation (aicmd helper
+      model).
+- [ ] Chunk boundaries: constructs spanning a split point (rare) render as two blocks.
+      Footnotes are not supported by md4c anyway.
 
 ## Cleanup
-- [ ] Remove the stray `nul` file in the repo root.
-- [ ] Decide what to do with untracked `example/`, `tc_plugin/`, `bak/`, `build_plugin_fixed.bat.bak`,
-      `build_commands.txt`, `task.txt`, and `TC_PLUGIN_README.md` (outdated).
-- [x] Add `*.wlx`, `*.wlx64` and `tests/harness/out/` to `.gitignore`.
-- [ ] `README.md` only describes the standalone viewer. Document the TC plugin there.
-- [ ] `CoInitializeEx` is called on every `ListLoad` without a matching `CoUninitialize`.
+- [ ] Untracked leftovers in the repo root (`example/`, `tc_plugin/`, `bak/`, `docs/` WebView2
+      notes, `webview-master/`, `packages/`, `*.obj`, `nul`, `TC_PLUGIN_README.md`): delete or
+      archive (needs the owner's OK).

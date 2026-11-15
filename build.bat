@@ -1,36 +1,24 @@
 @echo off
-REM Build script for Markdown Viewer using Visual Studio
-
-echo Building Markdown Viewer with Visual Studio...
-
-REM Try to find Visual Studio 2022 or 2019
-if exist "%ProgramFiles%\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat" (
-    call "%ProgramFiles%\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat"
-) else if exist "%ProgramFiles%\Microsoft Visual Studio\2022\Professional\VC\Auxiliary\Build\vcvars64.bat" (
-    call "%ProgramFiles%\Microsoft Visual Studio\2022\Professional\VC\Auxiliary\Build\vcvars64.bat"
-) else if exist "%ProgramFiles%\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat" (
-    call "%ProgramFiles%\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
-) else if exist "%ProgramFiles(x86)%\Microsoft Visual Studio\2019\Community\VC\Auxiliary\Build\vcvars64.bat" (
-    call "%ProgramFiles(x86)%\Microsoft Visual Studio\2019\Community\VC\Auxiliary\Build\vcvars64.bat"
-) else if exist "%ProgramFiles(x86)%\Microsoft Visual Studio\2019\Professional\VC\Auxiliary\Build\vcvars64.bat" (
-    call "%ProgramFiles(x86)%\Microsoft Visual Studio\2019\Professional\VC\Auxiliary\Build\vcvars64.bat"
-) else if exist "%ProgramFiles(x86)%\Microsoft Visual Studio\2019\Enterprise\VC\Auxiliary\Build\vcvars64.bat" (
-    call "%ProgramFiles(x86)%\Microsoft Visual Studio\2019\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
-) else (
-    echo Error: Visual Studio not found!
-    echo Please install Visual Studio 2019 or 2022
-    exit /b 1
+rem Configure, build (Release) and test with Visual Studio 2022's bundled CMake + Ninja.
+rem Outputs: build\mdview.exe, build\mdview.wlx64 (TC / Double Commander lister plugin)
+setlocal
+set "VSROOT=C:\Program Files\Microsoft Visual Studio\2022\Community"
+if not exist "%VSROOT%\Common7\Tools\VsDevCmd.bat" (
+  echo Visual Studio 2022 C++ tools not found. Use CMake from a developer prompt.
+  exit /b 1
 )
-
-REM Compile with MSVC
-cl /std:c++14 /EHsc /O2 /I"include" main.cpp /Fe:md_viewer.exe /link /SUBSYSTEM:WINDOWS /ENTRY:mainCRTStartup
-
-if %ERRORLEVEL% == 0 (
-    echo.
-    echo Build successful!
-    echo Run: md_viewer.exe yourfile.md
-) else (
-    echo.
-    echo Build failed!
-    exit /b 1
-)
+call "%VSROOT%\Common7\Tools\VsDevCmd.bat" -arch=x64 -no_logo >nul
+set "CMAKEBIN=%VSROOT%\Common7\IDE\CommonExtensions\Microsoft\CMake"
+set "PATH=%CMAKEBIN%\CMake\bin;%CMAKEBIN%\Ninja;%PATH%"
+pushd "%~dp0"
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+if errorlevel 1 goto :fail
+cmake --build build
+if errorlevel 1 goto :fail
+ctest --test-dir build --output-on-failure
+if errorlevel 1 goto :fail
+popd
+exit /b 0
+:fail
+popd
+exit /b 1

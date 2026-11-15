@@ -1,0 +1,1 @@
+md4c release-0.5.2, https://github.com/mity/md4c, MIT. Vendored unmodified 2026-11-14 (src/ files + LICENSE.md).

@@ -1,27 +1,29 @@
-# mdviewer
+# mdview (mdviewer)
 
-Home note for the **mdviewer** project. Open this `obsidian/` folder as a vault.
+Home note. Open the `obsidian/` folder as a vault.
 
 ## Purpose
 
-A lightweight native Markdown viewer for Windows, in two forms:
+A fast, **self-contained Markdown viewer component**, reusable in several hosts:
 
-1. **Total Commander lister plugin** (`tc_markdown_lister.wlx` / `.wlx64`), the main product.
-   Press F3 / Ctrl+Q on a `.md` file in Total Commander to see it rendered.
-   Source: `tc_markdown_lister.cpp`.
-2. **Standalone viewer** (`md_viewer.exe`, `main.cpp`): `md_viewer.exe file.md` opens a
-   window with the rendered file. It was the original prototype and is not actively developed.
+1. **Standalone viewer**: `mdview.exe file.md` (Windows window; Linux headless CLI for now).
+2. **Lister plugin** `mdview.wlx64` for **Total Commander**, and the same plugin for **Double
+   Commander** on Windows (DC on Linux/macOS: planned on the cairo backend).
+3. **aicmd** (`F:\devel\aicmd`, the user's own cross-platform file manager): the viewer for
+   `.md` files, either as a helper executable (aicmd's viewer convention) or linked in.
 
-Both convert Markdown to HTML in C++ (currently the header-only **maddy** parser) and show it
-in **Microsoft Edge WebView2**, so there is no Electron and no bundled browser.
+Markdown → HTML with **md4c**, laid out and drawn by the built-in **litehtml** engine through
+native 2D APIs (GDI/GDI+ on Windows, cairo/pango on Linux). There is no WebView2 or browser.
+Everything is vendored and statically linked.
 
-- Supported extensions: `.md .markdown .mdown .mkd .mkdn`
-- 64-bit only (TC 64-bit). Needs the WebView2 runtime (ships with Windows 10/11).
-- Remote: `ghjuricap:juricap/mdviewer.git` (GitHub `juricap/mdviewer`), branch `main`.
+Repo: `F:\devel\jpcservices\mdviewer`, remote `juricap/mdviewer` (not pushed; work is on the
+branch `fix/large-file-freeze`).
 
 ## Notes
 
-- [[Status]]: where things stand, progress log
-- [[TODO]]: open work, prioritised
-- [[Development]]: building, architecture, testing
-- [[Large file freeze]]: investigation of the 10–20 MB file hang (Nov 2026)
+- [[Architecture]]: layers, chunked/virtualized rendering, platform backends, hosts
+- [[Choices]]: decisions that should not silently change
+- [[Development]]: build, test, Linux checks, packaging
+- [[Status]]: verified state and progress log
+- [[TODO]]: open work
+- [[Large file freeze]]: the original TC freeze investigation (Nov 2026)

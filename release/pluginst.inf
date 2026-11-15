@@ -1,5 +1,5 @@
 [plugininstall]
-description=Markdown viewer with WebView2 rendering and GitHub-style formatting.
+description=mdview - fast self-contained Markdown viewer (md4c + litehtml, no WebView2)
 type=wlx
-file=tc_markdown_lister.wlx64
-defaultdir=plugins\wlx\MarkdownViewer
+file=mdview.wlx64
+defaultdir=mdview

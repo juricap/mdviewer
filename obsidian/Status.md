@@ -2,42 +2,52 @@
 
 Back to [[mdviewer]] · open work in [[TODO]].
 
-## Current state (2026-11-14)
+## Current state (2026-11-15), version 0.3.0
 
-- TC lister plugin: WebView2 rendering, **md4c parser (vendored, static)**, UTF-8/ANSI files,
-  dark-mode flag, ESC to close, zoom, context menu, search, copy and select-all.
-- **Large file freeze is fixed** and verified with the test harness and screenshots. A 20 MB file
-  shows formatted in about 1.5 s, and TC stays responsive throughout. It still needs testing in
-  real Total Commander. Details in [[Large file freeze]].
-- Remaining system dependency: the **WebView2 runtime** (Edge). The loader is linked statically,
-  but the runtime itself is a system component. Whether to replace it is an open question in [[TODO]].
-- Standalone `md_viewer.exe` (`main.cpp`) is a dormant prototype and still uses maddy.
+Verified:
+- **Windows:** `mdview.exe` (1.9 MB) and `mdview.wlx64` (1.9 MB) build with static CRT and no
+  warnings in our code. Core and render tests pass. Screenshots checked: light, dark, the 20 MB
+  file in the fake lister, End/PgUp in the standalone window.
+- **Linux (`ai`, Ubuntu 22.04):** the same core and renderer with the cairo/pango backend build
+  with no warnings in our code. Core and render tests pass. The `--png` output matches Windows.
+- Rendering: headings, emphasis, strikethrough, inline/block code (wrapped), tables with column
+  alignment and striped rows, task lists, nested/ordered lists, blockquotes, rules, autolinks,
+  relative images, Unicode including CJK and Greek, light/dark themes.
+
+Measured (release builds):
+
+| | Windows | Linux |
+|---|---|---|
+| 20 MB: decode + split | 0.05 s | 0.06 s |
+| 20 MB: first paint | 0.08 s | 0.10 s |
+| 20 MB: jump to middle / end | 0.08 s | 0.10 s |
+| 20 MB: scroll step (120 px) | 10 ms | 3.8 ms |
+| 20 MB: find text at the end | 3 ms | 2 ms |
+| fake TC lister: `ListLoadW` | ~15 ms | — |
+| worst UI stall (20 MB / 1 MB single line) | 104 ms / 134 ms | — |
+
+**Not yet verified:** inside real Total Commander or Double Commander, and aicmd integration.
 
 ## Progress log
 
-### 2026-11-14 (later): md4c
-- Vendored md4c 0.5.2 in `include/md4c/` and replaced maddy in the plugin. The cost-estimate and
-  plain-text fallback are removed.
-- Chunked `content-visibility:auto` sections for documents of 512 KB or more: WebView2 load of
-  20 MB went from 84 s to 6 s.
-- GitHub-flavoured extras: tables with alignment, task lists, strikethrough, autolinks.
-- `build_plugin_fixed.bat` compiles md4c in and no longer downloads maddy.
-- Added `tests/harness/bench_md4c.cpp`.
+### 2026-11-15: self-contained component (litehtml)
+- The user chose a built-in renderer (litehtml) over the OS web views, and asked for a reusable
+  component: standalone, TC plugin reusable for Double Commander, and aicmd, on all platforms.
+- Restructured into CMake: `src/core` (portable), `src/render` (portable litehtml virtualized
+  view), `src/platform/win32`, `src/platform/cairo`, `apps/mdview`, `plugins/wlx`, `tests`,
+  `third_party` (md4c 0.5.2, litehtml 0.10 vendored unmodified).
+- Removed the WebView2 plugin, the maddy/webview standalone and the old batch build scripts
+  (they remain in git history).
+- Fixes found along the way: blank-line detection (chunks never split), the UTF-8 check accepting
+  a truncated tail on untruncated files, and chunk sizes tuned to litehtml's measured layout
+  speed (~180 KB/s).
+- Added link-reference propagation across chunks, UTF-16 BOM support, `ListLoadNextW` window
+  reuse, link following, find highlight, and packaging (`scripts/package.ps1`).
+- Linux build and tests via `ssh ai` (`/data/devel/mdview-check-20261115`).
 
-### 2026-11-14
-- Created this Obsidian vault (`obsidian/`) with notes on purpose, development and status.
-- Investigated the TC freeze on 10–20 MB files. Benchmarked maddy: ~12 s/MB, and quadratic or
-  worse on long lines.
-- Rewrote `tc_markdown_lister.cpp`:
-  - worker-thread parsing, loading page, file-based navigation (no 2 MB limit)
-  - safe cancel on close, DLL refcount held by the worker, temp-file cleanup
-  - `ListLoad` now converts the path from ANSI (`CP_ACP`); before, it wrongly used UTF-8
-  - ANSI and wide entry points share one implementation
-  - ESC handler via `AddScriptToExecuteOnDocumentCreated`
-  - lister search via `window.find()`, Copy and Select All via `execCommand`
-  - `lcp_darkmode` honoured
-- Fixed `build_plugin_fixed.bat` reporting "Build failed!" after a successful build.
-- Added `tests/harness/` (fake lister host and benchmarks).
+### 2026-11-14: freeze fix (WebView2 era, superseded)
+- Worker-thread parsing, file navigation, and maddy replaced by md4c. See [[Large file freeze]].
+- Obsidian vault created.
 
 ### 2025-08-03 (from git history)
-- WebView2-based plugin completed, UTF-8/ANSI encoding support, release packaging (64-bit only).
+- WebView2-based TC plugin.

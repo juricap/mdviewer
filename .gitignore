@@ -15,8 +15,6 @@
 
 # Build directories
 build/
-Debug/
-Release/
 x64/
 x86/
 
@@ -49,3 +47,9 @@ tests/harness/out/
 # Obsidian per-user state
 obsidian/.obsidian/workspace*.json
 obsidian/.trash/
+
+# CMake build output and release artifacts
+build/
+artifacts/
+release/tc-markdown-viewer/
+release/*.zip

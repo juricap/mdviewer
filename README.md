@@ -1,73 +1,49 @@
-# Markdown Viewer
+# mdview
 
-A lightweight, native Markdown viewer for Windows built with C++ using [maddy](https://github.com/progsource/maddy) for Markdown parsing and [webview](https://github.com/webview/webview) for rendering.
+Fast, self-contained Markdown viewer component in C++17: one portable core and renderer, with
+thin frontends for a standalone app, the Total Commander / Double Commander lister plugin, and
+[aicmd](../../aicmd).
 
-## Features
+- **Parser:** [md4c](https://github.com/mity/md4c) (MIT), GitHub dialect: tables, task lists,
+  strikethrough, autolinks. Linear time: 20 MB in about 0.5 s.
+- **Renderer:** [litehtml](https://github.com/litehtml/litehtml) (BSD), a built-in HTML/CSS layout
+  engine drawing through native 2D APIs: GDI/GDI+ on Windows, cairo/pango on Linux. No WebView2,
+  no browser, no runtime to install.
+- **Large files:** the document is split into chunks and only what's on screen is laid out. A
+  20 MB file shows its first screen in about 0.1 s, and jumping anywhere or scrolling takes
+  milliseconds.
+- Everything is vendored in `third_party/` and built from source. The Windows binaries use the
+  static CRT.
 
-- Native Windows application (no Electron, minimal footprint)
-- GitHub-flavored Markdown support
-- Clean, professional styling
-- Fast and responsive
-- Small binary size (~500KB)
+Docs: [obsidian/mdviewer.md](obsidian/mdviewer.md) (architecture, choices, status, TODO).
 
-## Supported Markdown Features
+## Build
 
-- Headers (H1-H6)
-- Bold, italic, and inline code
-- Code blocks with syntax highlighting
-- Tables
-- Lists (ordered and unordered)
-- Blockquotes
-- Horizontal rules
-- Links
-- Images
+Windows (Visual Studio 2022):
 
-## Prerequisites
-
-- Windows 10/11 with WebView2 runtime (pre-installed on most systems)
-- Visual Studio 2019 or 2022 for building
-
-## Building from Source
-
-1. Clone the repository:
-```bash
-git clone https://github.com/juricap/mdviewer.git
-cd mdviewer
+```bat
+build.bat                      :: configure + build (Release, Ninja) + tests
+build\mdview.exe file.md       :: standalone viewer
+build\mdview.wlx64             :: lister plugin (Total Commander / Double Commander)
+powershell scripts\package.ps1 :: artifacts\release\mdview-<ver>.zip (TC auto-install)
 ```
 
-2. Run the build script:
-```bash
-setup_and_build.bat
+Linux (cairo, pango, pkg-config, CMake ≥ 3.16):
+
+```sh
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j && (cd build && ctest)
+build/mdview --png out.png file.md     # headless render (interactive frontend: planned)
 ```
 
-This will:
-- Download the WebView2 SDK
-- Compile the application
-- Create `md_viewer.exe`
+## Layout
 
-## Usage
-
-```bash
-md_viewer.exe <markdown-file>
-```
-
-Example:
-```bash
-md_viewer.exe README.md
-```
-
-## Dependencies
-
-- [maddy](https://github.com/progsource/maddy) - Header-only Markdown to HTML parser
-- [webview](https://github.com/webview/webview) - Cross-platform webview library
-- WebView2 - Microsoft Edge WebView2 runtime
-
-## License
-
-This project is open source. The dependencies have their own licenses:
-- maddy: MIT License
-- webview: MIT License
-
-## Contributing
-
-Contributions are welcome! Please feel free to submit a Pull Request.
+| Path | What |
+|---|---|
+| `src/core/` | portable document model: decode, chunk, md4c → HTML, CSS, search (no GUI types) |
+| `src/render/` | portable virtualized litehtml view: scrolling, hit testing, find |
+| `src/platform/win32/` | GDI/GDI+ container, Win32 view control, headless PNG render |
+| `src/platform/cairo/` | cairo/pango container, headless PNG render |
+| `apps/mdview/` | standalone app (Win32 window; CLI on other platforms) |
+| `plugins/wlx/` | WLX lister plugin wrapper |
+| `tests/` | core tests, render tests, fixtures, fake lister host |
+| `third_party/` | md4c 0.5.2, litehtml 0.10 (with gumbo), unmodified |
