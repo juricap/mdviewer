@@ -11,7 +11,7 @@ if (Test-Path $stage) { Remove-Item -Recurse -Force $stage }
 New-Item -ItemType Directory -Force "$stage\licenses" | Out-Null
 
 Copy-Item "$root\build\mdview.exe", "$root\build\mdview.wlx64" $stage
-Copy-Item "$root\release\pluginst.inf", "$root\release\README.md" $stage
+Copy-Item "$root\release\pluginst.inf", "$root\release\README.md", "$root\LICENSE" $stage
 Copy-Item "$root\third_party\md4c\LICENSE.md" "$stage\licenses\md4c-LICENSE.md"
 Copy-Item "$root\third_party\litehtml\LICENSE" "$stage\licenses\litehtml-LICENSE.txt"
 $gumboLicense = Get-ChildItem "$root\third_party\litehtml\src\gumbo" -Filter 'LICENSE*' | Select-Object -First 1

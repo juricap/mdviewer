@@ -2,7 +2,7 @@
 
 Fast, self-contained Markdown viewer component in C++17: one portable core and renderer, with
 thin frontends for a standalone app, the Total Commander / Double Commander lister plugin, and
-[aicmd](../../aicmd).
+[aicmd](https://github.com/juricap/aicmd).
 
 - **Parser:** [md4c](https://github.com/mity/md4c) (MIT), GitHub dialect: tables, task lists,
   strikethrough, autolinks. Linear time: 20 MB in about 0.5 s.
